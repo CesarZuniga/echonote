@@ -349,10 +349,16 @@ enum BenchKind {
         /// paths relative to the manifest's directory.
         #[arg(long)]
         manifest: PathBuf,
-        /// Speaker embedder ONNX model; names containing `campplus` load
-        /// CAM++, anything else ERes2Net.
+        /// Speaker embedder ONNX model.
         #[arg(long, env = "ECHO_EMBED_MODEL")]
         embedder: PathBuf,
+        /// Catalog id of the embedder (e.g. `embedder-campplus-multi`),
+        /// which selects its adapter and preset as the app does. Without
+        /// it the family is guessed from the file name: CAM++ names with
+        /// `zh_en`/`multi` are the multilingual CAM++, other `campplus`
+        /// names the EN CAM++, anything else ERes2Net.
+        #[arg(long)]
+        embedder_id: Option<String>,
         /// Pyannote segmenter ONNX model (tract-patched export). Without
         /// it each chunk is embedded whole.
         #[arg(long)]
@@ -360,11 +366,12 @@ enum BenchKind {
         /// Override the preset online-cluster similarity threshold.
         #[arg(long)]
         threshold: Option<f32>,
-        /// Override the preset online speaker cap.
-        #[arg(long)]
+        /// Override the preset online speaker cap (at least 1).
+        #[arg(long, value_parser = bench_der::parse_max_speakers)]
         max_speakers: Option<usize>,
-        /// Override the preset offline refinement merge threshold.
-        #[arg(long)]
+        /// Override the preset offline refinement merge threshold (a
+        /// cosine similarity in -1..=1).
+        #[arg(long, value_parser = bench_der::parse_cosine_threshold)]
         refine_threshold: Option<f32>,
         /// Skip the end-of-session offline refinement pass.
         #[arg(long, default_value_t = false)]
@@ -492,6 +499,7 @@ async fn main() -> Result<()> {
             BenchKind::Der {
                 manifest,
                 embedder,
+                embedder_id,
                 segmenter,
                 threshold,
                 max_speakers,
@@ -516,6 +524,7 @@ async fn main() -> Result<()> {
                 bench_der::run(bench_der::DerArgs {
                     manifest,
                     embedder,
+                    embedder_id,
                     segmenter,
                     threshold,
                     max_speakers,

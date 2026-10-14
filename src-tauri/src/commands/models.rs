@@ -204,7 +204,7 @@ fn model_catalog(root: &std::path::Path) -> Vec<(ModelInfo, &'static str, Option
             ModelInfo {
                 id: "embedder-camplusplus".into(),
                 label: "CAM++".into(),
-                description: "Speaker identification · ideal for Spanish".into(),
+                description: "Speaker identification · English (VoxCeleb)".into(),
                 kind: "embedder".into(),
                 present: present("models/embedder/campplus_en_voxceleb.onnx"),
                 size_bytes: 28_000_000,
@@ -850,6 +850,37 @@ mod tests {
                 Some(id.as_str())
             );
         }
+    }
+
+    #[test]
+    fn every_catalog_embedder_dispatches_by_its_id() {
+        // A catalog embedder must name its own family: without one it
+        // would silently load through the file-name fallback.
+        let embedders: Vec<String> = model_catalog(std::path::Path::new("/nonexistent"))
+            .into_iter()
+            .filter(|(info, _, _)| info.kind == "embedder")
+            .map(|(info, _, _)| info.id)
+            .collect();
+        assert!(!embedders.is_empty());
+        for id in &embedders {
+            let family = echo_diarize::EmbedderFamily::from_model_id(id)
+                .unwrap_or_else(|| panic!("catalog embedder {id} has no family"));
+            let rel = model_dest_path(id).unwrap_or_else(|| panic!("no dest for {id}"));
+            let path = std::path::Path::new("/data").join(rel);
+            assert_eq!(super::super::embedder_family(&path), family, "{id}");
+        }
+    }
+
+    #[test]
+    fn the_en_campplus_is_not_advertised_for_spanish() {
+        // T6/T6b DER benchmark: the multilingual CAM++ beats the EN
+        // CAM++ on Spanish (and on English).
+        let (info, _, _) = entry("embedder-camplusplus");
+        assert!(
+            !info.description.contains("Spanish"),
+            "{}",
+            info.description
+        );
     }
 
     #[test]
