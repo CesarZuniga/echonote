@@ -30,8 +30,8 @@ use time::OffsetDateTime;
 use tracing::{debug, warn};
 
 use echo_domain::{
-    CreateMeeting, DomainError, FinalizeMeeting, MeetingId, MeetingStore, Speaker,
-    StreamingSessionId, TranscriptEvent,
+    CreateMeeting, DomainError, FinalizeMeeting, MeetingId, MeetingStore, Speaker, SpeakerId,
+    SpeakerRef, StreamingSessionId, TranscriptEvent,
 };
 
 /// Stateful recorder. One instance per session is the simplest pattern,
@@ -127,26 +127,43 @@ impl MeetingRecorder {
                 language,
                 speaker_id,
                 speaker_slot,
+                speakers,
                 ..
             } => {
                 let meeting_id = self
                     .update_chunk_stats(session_id, segments, language)
                     .await;
                 if let Some(meeting_id) = meeting_id {
-                    // Persist the speaker BEFORE the segments so the
-                    // `segments.speaker_id` foreign key always finds
-                    // its row, even on the very first chunk for this
-                    // slot. Anonymous (label = None) — the rename use
-                    // case populates the label later, and the COALESCE
-                    // upsert keeps it from being clobbered by the next
-                    // recorder pass.
-                    if let (Some(sid), Some(slot)) = (speaker_id, speaker_slot) {
+                    // Persist EVERY speaker the chunk references BEFORE
+                    // its segments: `segments.speaker_id` is a foreign
+                    // key to `speakers(id)` and each segment may belong
+                    // to a different speaker than the chunk-dominant one,
+                    // so upserting only the dominant pair would make the
+                    // whole `append_segments` batch fail. The dominant
+                    // pair is also upserted for producers that predate
+                    // `speakers`. Anonymous (label = None) — the rename
+                    // use case populates the label later, and the
+                    // COALESCE upsert keeps it from being clobbered by
+                    // the next recorder pass.
+                    let dominant = match (speaker_id, speaker_slot) {
+                        (Some(id), Some(slot)) => Some(SpeakerRef {
+                            id: *id,
+                            slot: *slot,
+                        }),
+                        _ => None,
+                    };
+                    let mut seen: Vec<SpeakerId> = Vec::new();
+                    for r in speakers.iter().copied().chain(dominant) {
+                        if seen.contains(&r.id) {
+                            continue;
+                        }
+                        seen.push(r.id);
                         self.store
                             .upsert_speaker(
                                 meeting_id,
                                 &Speaker {
-                                    id: *sid,
-                                    slot: *slot,
+                                    id: r.id,
+                                    slot: r.slot,
                                     label: None,
                                 },
                             )
@@ -243,6 +260,42 @@ impl MeetingRecorder {
                     Ok(None)
                 }
             }
+            TranscriptEvent::SpeakersMerged { session_id, merges } => {
+                let meeting_id = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(session_id)
+                    .map(|s| s.meeting_id);
+                let Some(meeting_id) = meeting_id else {
+                    warn!(%session_id, "recorder: speakers-merged for unknown session");
+                    return Ok(None);
+                };
+                for m in merges {
+                    if m.absorbed == m.surviving {
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .store
+                        .merge_speakers(meeting_id, m.absorbed, m.surviving)
+                        .await
+                    {
+                        // Best-effort: a single merge failing shouldn't
+                        // abort the session's finalisation. Surface in
+                        // logs so the operator can see the DB is stale.
+                        warn!(
+                            %session_id, %meeting_id,
+                            absorbed = %m.absorbed, surviving = %m.surviving, error = %e,
+                            "recorder: merge_speakers failed"
+                        );
+                    }
+                }
+                debug!(
+                    %session_id, %meeting_id, merges = merges.len(),
+                    "recorder: offline diarization merges applied"
+                );
+                Ok(Some(meeting_id))
+            }
             // Paused / Resumed are informational UI events — the
             // recorder doesn't persist anything for them.
             TranscriptEvent::Paused { .. } | TranscriptEvent::Resumed { .. } => Ok(None),
@@ -330,6 +383,18 @@ mod tests {
                     entity: "meeting",
                     id: meeting_id.to_string(),
                 })?;
+            // Mirror SQLite's `segments.speaker_id REFERENCES speakers(id)`
+            // with `foreign_keys = ON`: the whole batch is rejected when a
+            // segment names a speaker that was never upserted.
+            if let Some(missing) = segments
+                .iter()
+                .filter_map(|s| s.speaker_id)
+                .find(|id| !m.speakers.iter().any(|sp| sp.id == *id))
+            {
+                return Err(DomainError::Invariant(format!(
+                    "FOREIGN KEY constraint failed: speaker {missing} not upserted"
+                )));
+            }
             for s in segments {
                 if !m.segments.iter().any(|x| x.id == s.id) {
                     m.segments.push(s.clone());
@@ -378,6 +443,33 @@ mod tests {
             };
             s.label = label.map(|l| l.to_string());
             Ok(true)
+        }
+        async fn merge_speakers(
+            &self,
+            meeting_id: MeetingId,
+            absorbed: SpeakerId,
+            surviving: SpeakerId,
+        ) -> Result<bool, DomainError> {
+            let mut guard = self.meetings.lock().unwrap();
+            let Some(m) = guard.iter_mut().find(|m| m.summary.id == meeting_id) else {
+                return Ok(false);
+            };
+            if !m.speakers.iter().any(|s| s.id == surviving) {
+                return Ok(false);
+            }
+            let mut changed = false;
+            for seg in &mut m.segments {
+                if seg.speaker_id == Some(absorbed) {
+                    seg.speaker_id = Some(surviving);
+                    changed = true;
+                }
+            }
+            let before = m.speakers.len();
+            m.speakers.retain(|s| s.id != absorbed);
+            if m.speakers.len() != before {
+                changed = true;
+            }
+            Ok(changed)
         }
         async fn list_speakers(&self, meeting_id: MeetingId) -> Result<Vec<Speaker>, DomainError> {
             let guard = self.meetings.lock().unwrap();
@@ -518,6 +610,7 @@ mod tests {
                 rtf: 0.1,
                 speaker_id: None,
                 speaker_slot: None,
+                speakers: vec![],
             })
             .await
             .unwrap();
@@ -531,6 +624,7 @@ mod tests {
                 rtf: 0.1,
                 speaker_id: None,
                 speaker_slot: None,
+                speakers: vec![],
             })
             .await
             .unwrap();
@@ -578,6 +672,7 @@ mod tests {
                     rtf: 0.1,
                     speaker_id: None,
                     speaker_slot: None,
+                    speakers: vec![],
                 })
                 .await
                 .unwrap();
@@ -632,6 +727,7 @@ mod tests {
                     rtf: 0.1,
                     speaker_id: Some(sid),
                     speaker_slot: Some(slot),
+                    speakers: vec![SpeakerRef { id: sid, slot }],
                 })
                 .await
                 .unwrap();
@@ -673,10 +769,60 @@ mod tests {
                 rtf: 0.0,
                 speaker_id: None,
                 speaker_slot: None,
+                speakers: vec![],
             })
             .await
             .unwrap();
         assert_eq!(result, None);
         assert!(store.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn segments_referencing_non_dominant_speakers_are_persisted() {
+        let store = Arc::new(FakeStore::default());
+        let recorder = MeetingRecorder::with_default_title(store.clone());
+        let session = StreamingSessionId::new();
+        recorder
+            .record(&TranscriptEvent::Started {
+                session_id: session,
+                input_format: AudioFormat::WHISPER,
+            })
+            .await
+            .unwrap();
+
+        let alice = SpeakerId::new();
+        let bob = SpeakerId::new();
+        let mut first = segment(0, 1_000, "a");
+        first.speaker_id = Some(alice);
+        let mut second = segment(1_000, 2_000, "b");
+        second.speaker_id = Some(bob);
+
+        // Chunk-dominant speaker is Alice, but the second segment
+        // belongs to Bob: both rows must exist before the segments.
+        recorder
+            .record(&TranscriptEvent::Chunk {
+                session_id: session,
+                chunk_index: 0,
+                offset_ms: 0,
+                segments: vec![first, second],
+                language: Some("en".into()),
+                rtf: 0.1,
+                speaker_id: Some(alice),
+                speaker_slot: Some(0),
+                speakers: vec![
+                    SpeakerRef { id: alice, slot: 0 },
+                    SpeakerRef { id: bob, slot: 1 },
+                ],
+            })
+            .await
+            .expect("every referenced speaker must be upserted before append_segments");
+
+        let snap = store.snapshot();
+        assert_eq!(snap[0].segments.len(), 2);
+        assert!(snap[0]
+            .speakers
+            .iter()
+            .any(|s| s.id == alice && s.slot == 0));
+        assert!(snap[0].speakers.iter().any(|s| s.id == bob && s.slot == 1));
     }
 }

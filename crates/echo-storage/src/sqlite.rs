@@ -199,6 +199,57 @@ impl MeetingStore for SqliteMeetingStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn merge_speakers(
+        &self,
+        meeting_id: MeetingId,
+        absorbed: SpeakerId,
+        surviving: SpeakerId,
+    ) -> Result<bool, DomainError> {
+        // Two-step in a single transaction so we never end up with
+        // segments pointing at a deleted speaker row even if a crash
+        // wedges the connection between statements.
+        let meeting_str = meeting_id.to_string();
+        let absorbed_str = absorbed.0.to_string();
+        let surviving_str = surviving.0.to_string();
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx("begin tx"))?;
+
+        // Bail out cleanly if `surviving` is not actually a speaker on
+        // this meeting — applying the rewrite would orphan segments.
+        let surviving_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM speakers WHERE id = ? AND meeting_id = ?")
+                .bind(&surviving_str)
+                .bind(&meeting_str)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(map_sqlx("verify surviving speaker"))?;
+        if surviving_exists == 0 {
+            tx.rollback().await.map_err(map_sqlx("rollback tx"))?;
+            return Ok(false);
+        }
+
+        let seg_update = sqlx::query(
+            "UPDATE segments SET speaker_id = ? \
+             WHERE meeting_id = ? AND speaker_id = ?",
+        )
+        .bind(&surviving_str)
+        .bind(&meeting_str)
+        .bind(&absorbed_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx("rewrite segments speaker_id"))?;
+
+        let row_delete = sqlx::query("DELETE FROM speakers WHERE id = ? AND meeting_id = ?")
+            .bind(&absorbed_str)
+            .bind(&meeting_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx("delete absorbed speaker"))?;
+
+        tx.commit().await.map_err(map_sqlx("commit tx"))?;
+        Ok(seg_update.rows_affected() > 0 || row_delete.rows_affected() > 0)
+    }
+
     async fn rename_meeting(
         &self,
         meeting_id: MeetingId,
@@ -1462,5 +1513,36 @@ mod tests {
         let listed = store.list(0).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn append_segments_rejects_speaker_that_was_never_upserted() {
+        // Documents the `segments.speaker_id REFERENCES speakers(id)`
+        // failure mode (foreign_keys = ON): the recorder must upsert
+        // every speaker a chunk references before appending, otherwise
+        // the whole batch is rejected and its segments are lost.
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let id = MeetingId::new();
+        store
+            .create(CreateMeeting {
+                id,
+                title: "fk".into(),
+                input_format: fmt(),
+            })
+            .await
+            .unwrap();
+
+        let mut seg = segment(0, 1_000, "orphan");
+        seg.speaker_id = Some(SpeakerId::new());
+        let err = store
+            .append_segments(id, &[seg])
+            .await
+            .expect_err("unknown speaker id must violate the foreign key");
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "unexpected error: {err}"
+        );
+        let meeting = store.get(id).await.unwrap().expect("meeting exists");
+        assert!(meeting.segments.is_empty(), "failed batch must not persist");
     }
 }
