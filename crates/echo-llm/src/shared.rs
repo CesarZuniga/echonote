@@ -21,7 +21,7 @@
 //! `LlamaModel` is `Send + Sync`. llama.cpp tolerates **multiple
 //! `LlamaContext`s** built from the same model running in parallel —
 //! each context owns its own KV cache, so the only constraint is host
-//! RAM (one ~50 MB KV cache per concurrent request at the default
+//! RAM (one KV cache per concurrent request, ~1.2 GB for Qwen3-8B at the default
 //! `n_ctx`). The single decoding constraint is **per-context**: a
 //! single context cannot be decoded from two threads at once, but the
 //! adapters in this crate never share a context across calls (each
@@ -45,7 +45,9 @@
 use std::path::PathBuf;
 
 use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+
+use echo_domain::estimate_tokens;
 
 // ---------------------------------------------------------------------------
 // Think-block stripping (Qwen 3 reasoning suppression)
@@ -113,6 +115,37 @@ pub(crate) struct LoadedModel {
     pub n_threads: Option<i32>,
 }
 
+impl LoadedModel {
+    /// Token count of `text` under the model's own tokenizer, shared by
+    /// the `count_tokens` overrides of every adapter.
+    ///
+    /// `AddBos::Never` mirrors how prompts are tokenized at generation
+    /// time, so the count matches what the context will actually hold.
+    /// A tokenizer failure falls back to the conservative
+    /// [`estimate_tokens`] instead of erroring: a budget query must not
+    /// be able to abort a request the estimate could still size safely.
+    pub fn count_tokens(&self, text: &str) -> usize {
+        token_count_or_estimate(self.model.str_to_token(text, AddBos::Never), text)
+    }
+}
+
+/// Length of a successful tokenization, or the [`estimate_tokens`]
+/// fallback when the tokenizer failed. Split out of
+/// [`LoadedModel::count_tokens`] so the fallback is testable without a
+/// loaded model.
+fn token_count_or_estimate<T, E: std::fmt::Display>(
+    tokenized: Result<Vec<T>, E>,
+    text: &str,
+) -> usize {
+    match tokenized {
+        Ok(tokens) => tokens.len(),
+        Err(e) => {
+            tracing::warn!(error = %e, "tokenizer failed, using the bytes/2 estimate");
+            estimate_tokens(text)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -120,6 +153,19 @@ pub(crate) struct LoadedModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_count_uses_the_tokenizer_result_when_it_succeeds() {
+        let tokenized: Result<Vec<u32>, String> = Ok(vec![1, 2, 3, 4]);
+        assert_eq!(token_count_or_estimate(tokenized, "irrelevant text"), 4);
+    }
+
+    #[test]
+    fn token_count_falls_back_to_the_estimate_when_tokenizing_fails() {
+        let tokenized: Result<Vec<u32>, String> = Err("invalid utf-8".into());
+        // 7 bytes -> ceil(7 / 2) = 4 tokens.
+        assert_eq!(token_count_or_estimate(tokenized, "abcdefg"), 4);
+    }
 
     #[test]
     fn strip_single_think_block() {

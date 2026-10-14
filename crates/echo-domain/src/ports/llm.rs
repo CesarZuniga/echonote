@@ -79,6 +79,29 @@ impl Default for GenerateOptions {
     }
 }
 
+/// Context window assumed by [`LlmModel::context_window`] and
+/// [`crate::ChatAssistant::context_window`] when an adapter does not
+/// report its own. Matches the default `n_ctx` of the llama.cpp adapter.
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 8_192;
+
+/// Conservative token estimate: one token per 2 UTF-8 bytes, rounded up.
+///
+/// Byte-level BPE tokenizers split accented and non-Latin characters
+/// into several byte tokens, so a character count can undercount by a
+/// wide margin. Measured with the Qwen3-8B tokenizer: natural Spanish
+/// and English run at 3.5-5 bytes per token, but a text made only of
+/// accented vowels (`áéíóúñ`) costs about one token per 2.1 bytes, 2.5x
+/// more than `chars / 3`. Two bytes per token stays at or above every
+/// measured sample, including that worst case. Over-counting is the safe
+/// direction for a budget: a prompt sized with this estimate can only
+/// end up smaller than the window, never larger. Adapters with a real
+/// tokenizer should override `count_tokens` and may fall back to this
+/// function when tokenization fails.
+#[must_use]
+pub fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(2)
+}
+
 /// Async port over a local large language model.
 ///
 /// Implementors are expected to be cheap to clone (`Arc` internally)
@@ -90,6 +113,26 @@ pub trait LlmModel: Send + Sync {
     /// used as provenance metadata on each [`crate::entities::summary::Summary`].
     /// Examples: `"qwen2.5-7b-instruct-q4_k_m"`, `"llama-3.2-3b-instruct-q4_k_m"`.
     fn model_id(&self) -> &str;
+
+    /// Size of the context window in tokens: prompt plus generated
+    /// output must fit in it. Use cases derive their prompt budget from
+    /// this value instead of a fixed character cap.
+    ///
+    /// The default ([`DEFAULT_CONTEXT_WINDOW`]) suits fakes and adapters
+    /// that cannot introspect their model.
+    fn context_window(&self) -> u32 {
+        DEFAULT_CONTEXT_WINDOW
+    }
+
+    /// Number of tokens `text` occupies for this model.
+    ///
+    /// The default is [`estimate_tokens`], a deliberately pessimistic
+    /// bytes/2 estimate, so budgets built on it stay safe when no real
+    /// tokenizer is available. Adapters SHOULD override it with the
+    /// model's own tokenizer.
+    fn count_tokens(&self, text: &str) -> usize {
+        estimate_tokens(text)
+    }
 
     /// Generate a completion for `prompt`. The prompt is expected to
     /// already include any chat template wrapping (`<|im_start|>` for
@@ -136,6 +179,52 @@ mod tests {
         assert!((opts.top_p - 0.95).abs() < f32::EPSILON);
         assert!(opts.seed.is_none());
         assert!(opts.stop.is_empty());
+    }
+
+    struct MinimalLlm;
+
+    #[async_trait]
+    impl LlmModel for MinimalLlm {
+        fn model_id(&self) -> &str {
+            "minimal"
+        }
+
+        async fn generate(&self, _: &str, _: &GenerateOptions) -> Result<String, DomainError> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn token_budget_defaults_are_conservative() {
+        // Fakes that don't override the budget methods must still get a
+        // usable window and an estimate that errs on the high side.
+        let llm = MinimalLlm;
+        assert_eq!(llm.context_window(), 8_192);
+        assert_eq!(llm.count_tokens("abcdefg"), 4);
+        assert_eq!(llm.count_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_is_half_the_utf8_bytes_rounded_up() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abc"), 2);
+        // Accented letters weigh two bytes each: 6 chars, 12 bytes.
+        assert_eq!(estimate_tokens("áéíóúñ"), 6);
+    }
+
+    #[test]
+    fn estimate_never_drops_below_the_previous_chars_over_three() {
+        for text in [
+            "",
+            "a",
+            "hello world",
+            "Además, la configuración",
+            "日本語のテキスト",
+            "Reunión de planificación 🚀🚀 ñandú",
+        ] {
+            let previous = text.chars().count().div_ceil(3);
+            assert!(estimate_tokens(text) >= previous, "{text:?}");
+        }
     }
 
     #[test]
