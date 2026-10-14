@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::entities::segment::Segment;
+use crate::entities::segment::{Segment, SegmentId};
 use crate::entities::speaker::SpeakerId;
 use crate::ports::audio::AudioFormat;
 
@@ -44,8 +44,8 @@ impl std::fmt::Display for StreamingSessionId {
 pub struct StreamingOptions {
     /// ISO-639-1 language hint for the ASR backend. `None` ⇒ auto.
     pub language: Option<String>,
-    /// Maximum audio buffered before forcing a transcribe pass, in
-    /// milliseconds. Default 5000 (5 s) — Whisper's sweet spot.
+    /// Fixed chunk length in milliseconds, used when no VAD is attached
+    /// or `speech_aligned_chunks` is `false`. Default 5000 (5 s).
     pub chunk_ms: u32,
     /// Skip transcription of chunks whose RMS is below this threshold.
     /// `0.0` disables the gate. Default 0.02 (~ -34 dBFS), aligned
@@ -60,6 +60,43 @@ pub struct StreamingOptions {
     /// your mic environment is louder, raise it; if you have a soft
     /// speaker or a noise-cancelling headset, lower it.
     pub silence_rms_threshold: f32,
+    /// Cut chunks at speech pauses instead of every `chunk_ms`. Only
+    /// takes effect when a VAD is attached to the pipeline; without one
+    /// the pipeline always uses fixed `chunk_ms` chunks and the RMS
+    /// gate. Default `true`: Whisper is far more accurate on whole
+    /// utterances than on fixed chunks that cut words.
+    #[serde(default = "default_speech_aligned_chunks")]
+    pub speech_aligned_chunks: bool,
+    /// Speech-aligned mode: shortest chunk cut at a speech pause, in
+    /// milliseconds, unless the utterance is followed by silence.
+    /// Default 4000 (tuned in `docs/spikes/2026-10-vad-chunking-bench.md`).
+    #[serde(default = "default_min_chunk_ms")]
+    pub min_chunk_ms: u32,
+    /// Speech-aligned mode: longest chunk, in milliseconds. Without a
+    /// pause by then the chunk is cut at the quietest point shortly
+    /// before it. Must be `>= min_chunk_ms`. Default 20000 (Whisper
+    /// decodes up to 30 s windows).
+    #[serde(default = "default_max_chunk_ms")]
+    pub max_chunk_ms: u32,
+}
+
+/// Default for [`StreamingOptions::speech_aligned_chunks`].
+const DEFAULT_SPEECH_ALIGNED_CHUNKS: bool = true;
+/// Default for [`StreamingOptions::min_chunk_ms`].
+const DEFAULT_MIN_CHUNK_MS: u32 = 4_000;
+/// Default for [`StreamingOptions::max_chunk_ms`].
+const DEFAULT_MAX_CHUNK_MS: u32 = 20_000;
+
+fn default_speech_aligned_chunks() -> bool {
+    DEFAULT_SPEECH_ALIGNED_CHUNKS
+}
+
+fn default_min_chunk_ms() -> u32 {
+    DEFAULT_MIN_CHUNK_MS
+}
+
+fn default_max_chunk_ms() -> u32 {
+    DEFAULT_MAX_CHUNK_MS
 }
 
 impl Default for StreamingOptions {
@@ -68,6 +105,9 @@ impl Default for StreamingOptions {
             language: None,
             chunk_ms: 5_000,
             silence_rms_threshold: 0.02,
+            speech_aligned_chunks: DEFAULT_SPEECH_ALIGNED_CHUNKS,
+            min_chunk_ms: DEFAULT_MIN_CHUNK_MS,
+            max_chunk_ms: DEFAULT_MAX_CHUNK_MS,
         }
     }
 }
@@ -120,6 +160,13 @@ pub enum TranscriptEvent {
         /// chip). 0-based; `None` whenever `speaker_id` is `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         speaker_slot: Option<u32>,
+        /// Every distinct speaker referenced by `segments` (each
+        /// segment may belong to a different speaker than the
+        /// chunk-dominant one above), so consumers can persist them
+        /// before the segments. Defaults to empty so payloads from
+        /// older producers still deserialise.
+        #[serde(default)]
+        speakers: Vec<SpeakerRef>,
     },
     /// A chunk was discarded by the silence gate before being sent to
     /// the ASR backend. Useful for UI / metrics.
@@ -135,6 +182,49 @@ pub enum TranscriptEvent {
         duration_ms: u32,
         /// RMS of the skipped chunk (for diagnostics).
         rms: f32,
+    },
+    /// Offline diarization refinement after the streaming loop ended.
+    ///
+    /// Carries `(absorbed_id, surviving_id)` pairs the storage layer
+    /// must apply to already-persisted segments: every reference to
+    /// `absorbed_id` is rewritten to `surviving_id`, and the absorbed
+    /// speaker row is deleted. Always emitted *before* [`Stopped`] so
+    /// consumers can finalise the meeting with the correct speaker
+    /// count. Empty `merges` is allowed — the recorder treats it as a
+    /// no-op.
+    #[serde(rename_all = "camelCase")]
+    SpeakersMerged {
+        /// Session id.
+        session_id: StreamingSessionId,
+        /// `(absorbed, surviving)` pairs produced by the diarizer's
+        /// offline refinement pass.
+        merges: Vec<SpeakerMerge>,
+    },
+    /// Offline re-segmentation after the streaming loop ended (ADR 0001).
+    ///
+    /// Moves already-emitted segments between speakers, creates
+    /// speakers and retires speakers left without segments. Emitted
+    /// after the last [`Chunk`](Self::Chunk) and before
+    /// [`Stopped`](Self::Stopped), only when at least one segment
+    /// changes speaker.
+    ///
+    /// Every field is a set-to-value, never a delta, so applying the
+    /// event twice gives the same state. It carries ids, slots and
+    /// indices only: no embeddings, scores or text.
+    #[serde(rename_all = "camelCase")]
+    SpeakersReassigned {
+        /// Session id.
+        session_id: StreamingSessionId,
+        /// UUIDv7 of this plan; lets consumers detect a replay.
+        plan_id: Uuid,
+        /// Speakers the plan introduces. Persist them before `segments`.
+        created: Vec<SpeakerRef>,
+        /// Speakers left without segments.
+        retired: Vec<SpeakerRetirement>,
+        /// Segments whose speaker changed, with their new speaker.
+        segments: Vec<SegmentSpeaker>,
+        /// Chunks whose dominant speaker changed (live pane).
+        chunks: Vec<ChunkSpeaker>,
     },
     /// The pipeline finished cleanly (caller stopped or stream EOF).
     #[serde(rename_all = "camelCase")]
@@ -169,6 +259,64 @@ pub enum TranscriptEvent {
     },
 }
 
+/// A speaker referenced by a [`TranscriptEvent::Chunk`]: its stable id
+/// plus the arrival-order slot the recorder persists it under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerRef {
+    /// Speaker identifier, as referenced by `Segment::speaker_id`.
+    pub id: SpeakerId,
+    /// Arrival-order slot (0-based) of the speaker.
+    pub slot: u32,
+}
+
+/// One offline-refinement merge: `absorbed` is collapsed into
+/// `surviving`. Persisted segments referring to `absorbed` must be
+/// rewritten to point at `surviving`; the `absorbed` speaker row is
+/// dropped from the meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerMerge {
+    /// Speaker the offline pass decided was a duplicate.
+    pub absorbed: SpeakerId,
+    /// Speaker the absorbed one is folded into.
+    pub surviving: SpeakerId,
+}
+
+/// A speaker the offline pass left without segments, and the speaker
+/// that took most of its speech. The recipient may inherit its user
+/// label (ADR 0001, Q1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerRetirement {
+    /// Retired speaker.
+    pub speaker: SpeakerId,
+    /// Speaker that received the majority of its duration, if any.
+    pub majority_recipient: Option<SpeakerId>,
+}
+
+/// New speaker of one already-emitted segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentSpeaker {
+    /// Segment id, as emitted in a `Chunk` event.
+    pub segment_id: SegmentId,
+    /// Its speaker after the refine; `None` leaves it unattributed.
+    pub speaker_id: Option<SpeakerId>,
+}
+
+/// New dominant speaker of one already-emitted chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkSpeaker {
+    /// Chunk index, as emitted in a `Chunk` event.
+    pub chunk_index: u32,
+    /// Dominant speaker after the refine.
+    pub speaker_id: Option<SpeakerId>,
+    /// Arrival-order slot of `speaker_id`.
+    pub speaker_slot: Option<u32>,
+}
+
 impl TranscriptEvent {
     /// Session id this event belongs to. Convenient for routing in the UI.
     #[must_use]
@@ -177,6 +325,8 @@ impl TranscriptEvent {
             Self::Started { session_id, .. }
             | Self::Chunk { session_id, .. }
             | Self::Skipped { session_id, .. }
+            | Self::SpeakersMerged { session_id, .. }
+            | Self::SpeakersReassigned { session_id, .. }
             | Self::Stopped { session_id, .. }
             | Self::Failed { session_id, .. }
             | Self::Paused { session_id, .. }
@@ -196,6 +346,15 @@ mod tests {
         assert_eq!(opts.chunk_ms, 5_000);
         assert!(opts.silence_rms_threshold > 0.0);
         assert!(opts.language.is_none());
+        assert!(opts.speech_aligned_chunks);
+        assert_eq!((opts.min_chunk_ms, opts.max_chunk_ms), (4_000, 20_000));
+    }
+
+    #[test]
+    fn options_without_chunk_bounds_deserialize_with_defaults() {
+        let json = r#"{"language":null,"chunk_ms":5000,"silence_rms_threshold":0.02}"#;
+        let opts: StreamingOptions = serde_json::from_str(json).unwrap();
+        assert_eq!(opts, StreamingOptions::default());
     }
 
     #[test]
@@ -217,6 +376,62 @@ mod tests {
             !json.contains("\"sample_rate_hz\""),
             "AudioFormat leaked snake_case to the wire: {json}"
         );
+    }
+
+    fn reassigned_event() -> TranscriptEvent {
+        let (a, b) = (SpeakerId::new(), SpeakerId::new());
+        TranscriptEvent::SpeakersReassigned {
+            session_id: StreamingSessionId::new(),
+            plan_id: Uuid::now_v7(),
+            created: vec![SpeakerRef { id: b, slot: 4 }],
+            retired: vec![SpeakerRetirement {
+                speaker: SpeakerId::new(),
+                majority_recipient: Some(a),
+            }],
+            segments: vec![SegmentSpeaker {
+                segment_id: SegmentId::new(),
+                speaker_id: Some(b),
+            }],
+            chunks: vec![ChunkSpeaker {
+                chunk_index: 2,
+                speaker_id: Some(b),
+                speaker_slot: Some(4),
+            }],
+        }
+    }
+
+    #[test]
+    fn speakers_reassigned_round_trips_in_camel_case() {
+        let evt = reassigned_event();
+        let json = serde_json::to_string(&evt).unwrap();
+        for key in [
+            "\"type\":\"speakersReassigned\"",
+            "\"planId\"",
+            "\"majorityRecipient\"",
+            "\"segmentId\"",
+            "\"chunkIndex\":2",
+            "\"speakerSlot\":4",
+        ] {
+            assert!(json.contains(key), "missing {key}: {json}");
+        }
+        let back: TranscriptEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, evt);
+    }
+
+    #[test]
+    fn speakers_reassigned_carries_no_float_arrays() {
+        // Privacy (ADR 0001): ids, slots and indices only, never
+        // embeddings or scores.
+        let json = serde_json::to_value(reassigned_event()).unwrap();
+        fn has_float(v: &serde_json::Value) -> bool {
+            match v {
+                serde_json::Value::Number(n) => n.is_f64() && !n.is_u64() && !n.is_i64(),
+                serde_json::Value::Array(a) => a.iter().any(has_float),
+                serde_json::Value::Object(o) => o.values().any(has_float),
+                _ => false,
+            }
+        }
+        assert!(!has_float(&json), "float leaked: {json}");
     }
 
     #[test]
@@ -241,6 +456,7 @@ mod tests {
             rtf: 0.1,
             speaker_id: None,
             speaker_slot: None,
+            speakers: vec![],
         };
         let json = serde_json::to_string(&evt).unwrap();
         assert!(
@@ -266,6 +482,7 @@ mod tests {
             rtf: 0.2,
             speaker_id: Some(speaker),
             speaker_slot: Some(1),
+            speakers: vec![],
         };
         let json = serde_json::to_string(&evt).unwrap();
         assert!(json.contains("\"speakerId\""), "got: {json}");
@@ -299,5 +516,49 @@ mod tests {
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn chunk_without_speakers_field_still_deserialises() {
+        // Payload produced by a pre-`speakers` build (older frontend,
+        // MCP sidecar, persisted fixture).
+        let json = r#"{
+            "type": "chunk",
+            "sessionId": "0190a000-0000-7000-8000-000000000000",
+            "chunkIndex": 3,
+            "offsetMs": 1500,
+            "segments": [],
+            "language": "en",
+            "rtf": 0.1
+        }"#;
+        let evt: TranscriptEvent = serde_json::from_str(json).expect("old payload");
+        match evt {
+            TranscriptEvent::Chunk { speakers, .. } => assert!(speakers.is_empty()),
+            other => panic!("expected Chunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chunk_speakers_round_trip_in_camel_case() {
+        let id = SpeakerId::new();
+        let evt = TranscriptEvent::Chunk {
+            session_id: StreamingSessionId::new(),
+            chunk_index: 0,
+            offset_ms: 0,
+            segments: vec![],
+            language: None,
+            rtf: 0.0,
+            speaker_id: Some(id),
+            speaker_slot: Some(0),
+            speakers: vec![SpeakerRef { id, slot: 0 }],
+        };
+        let json = serde_json::to_value(&evt).unwrap();
+        assert_eq!(json["speakers"][0]["slot"], 0);
+        assert_eq!(
+            json["speakers"][0]["id"],
+            serde_json::json!(id.0.to_string())
+        );
+        let back: TranscriptEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back, evt);
     }
 }

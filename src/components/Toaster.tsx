@@ -55,12 +55,13 @@ type ToastAction =
 
 function reducer(state: Toast[], action: ToastAction): Toast[] {
   switch (action.type) {
-    case "PUSH":
+    case "PUSH": {
       // Cap the stack at 5; drop the oldest non-error first.
       if (state.length < 5) return [...state, action.toast];
       const idx = state.findIndex((t) => t.kind !== "error");
       const next = idx >= 0 ? state.filter((_, i) => i !== idx) : state.slice(1);
       return [...next, action.toast];
+    }
     case "UPDATE":
       return state.map((t) =>
         t.id === action.id ? { ...t, ...action.fields } : t,
@@ -233,7 +234,7 @@ function ToastCard({ toast }: { toast: Toast }) {
   return (
     <div
       role={toast.kind === "error" ? "alert" : "status"}
-      className={`pointer-events-auto rounded-md border px-3 py-2 text-ui-sm shadow-md backdrop-blur ${kindClasses(toast.kind)}`}
+      className={`pointer-events-auto rounded-md border px-3 py-2 text-ui-sm shadow-md backdrop-blur-sm ${kindClasses(toast.kind)}`}
     >
       <div className="flex items-start gap-2">
         <span aria-hidden className="mt-0.5 font-mono">
@@ -242,7 +243,7 @@ function ToastCard({ toast }: { toast: Toast }) {
         <div className="flex flex-1 flex-col gap-1">
           <p className="font-medium leading-snug">{toast.message}</p>
           {toast.detail && (
-            <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-surface-inset/40 p-1.5 font-mono text-micro leading-tight">
+            <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-sm bg-surface-inset/40 p-1.5 font-mono text-micro leading-tight">
               {toast.detail}
             </pre>
           )}
@@ -252,7 +253,7 @@ function ToastCard({ toast }: { toast: Toast }) {
                 ref={copyRef}
                 type="button"
                 onClick={onCopy}
-                className="rounded border border-current/30 px-1.5 py-0.5 text-micro uppercase tracking-wide opacity-80 hover:opacity-100"
+                className="rounded-sm border border-current/30 px-1.5 py-0.5 text-micro uppercase tracking-wide opacity-80 hover:opacity-100"
               >
                 {t("toast.copy")}
               </button>
@@ -266,7 +267,7 @@ function ToastCard({ toast }: { toast: Toast }) {
                   toast.action!.onClick();
                   dismiss(toast.id);
                 }}
-                className="rounded border border-current/30 px-2 py-0.5 text-micro font-semibold uppercase tracking-wide opacity-80 hover:opacity-100"
+                className="rounded-sm border border-current/30 px-2 py-0.5 text-micro font-semibold uppercase tracking-wide opacity-80 hover:opacity-100"
               >
                 {toast.action.label}
               </button>
@@ -277,7 +278,7 @@ function ToastCard({ toast }: { toast: Toast }) {
           type="button"
           onClick={() => dismiss(toast.id)}
           aria-label={t("toast.dismiss")}
-          className="-m-1 rounded p-1 opacity-60 hover:opacity-100"
+          className="-m-1 rounded-sm p-1 opacity-60 hover:opacity-100"
         >
           ×
         </button>

@@ -25,11 +25,16 @@ pub use ports::audio::{
     AudioCapture, AudioFormat, AudioFrame, AudioSource, AudioStream, CaptureSpec, DeviceInfo,
     Sample,
 };
-pub use ports::chat::{ChatAssistant, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToken};
-pub use ports::diarizer::Diarizer;
-pub use ports::llm::{GenerateOptions, LlmModel};
+pub use ports::chat::{
+    render_chatml, ChatAssistant, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToken,
+};
+pub use ports::diarizer::{
+    ChunkContext, Diarizer, RefineBudget, RefineOutcome, SpanRef, SpanRelabelPlan, SpeakerSpan,
+};
+pub use ports::llm::{estimate_tokens, GenerateOptions, LlmModel, DEFAULT_CONTEXT_WINDOW};
 pub use ports::punctuator::Punctuator;
 pub use ports::resampler::Resampler;
+pub use ports::retrieval::{SegmentHit, SegmentRetriever};
 pub use ports::segmenter::{Segmenter, SpeakerSegment};
 pub use ports::transcriber::{TranscribeOptions, Transcriber, Transcript};
 pub use ports::vad::{Vad, VoiceState};
@@ -39,8 +44,13 @@ pub use entities::meeting::{Meeting, MeetingId, MeetingSearchHit, MeetingSummary
 pub use entities::note::{Note, NoteId};
 pub use entities::segment::{Segment, SegmentId};
 pub use entities::speaker::{Speaker, SpeakerId};
-pub use entities::streaming::{StreamingOptions, StreamingSessionId, TranscriptEvent};
+pub use entities::streaming::{
+    ChunkSpeaker, SegmentSpeaker, SpeakerMerge, SpeakerRef, SpeakerRetirement, StreamingOptions,
+    StreamingSessionId, TranscriptEvent,
+};
 pub use entities::summary::{
     ActionItem, Definition, InterviewQuote, Summary, SummaryContent, SummaryId, TEMPLATE_IDS,
 };
-pub use ports::storage::{CreateMeeting, FinalizeMeeting, MeetingStore};
+pub use ports::storage::{
+    CreateMeeting, FinalizeMeeting, MeetingStore, ReassignOutcome, SpeakerReassignment,
+};

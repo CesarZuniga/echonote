@@ -138,11 +138,17 @@ All processing happens locally using open-source models:
 |-------|---------|------|
 | [Whisper](https://github.com/ggerganov/whisper.cpp) | Speech-to-text | 148 MB – 1.6 GB |
 | [Qwen 3](https://huggingface.co/Qwen) | Summaries & chat | 2.6 – 9.2 GB |
-| [Silero VAD](https://github.com/snakers4/silero-vad) | Voice activity detection | ~1.2 MB |
+| [Silero VAD](https://github.com/snakers4/silero-vad) v6.2 | Voice activity detection | ~1.5 MB |
 | [3D-Speaker](https://github.com/modelscope/3D-Speaker) | Speaker embeddings (ERes2Net / CAM++) | ~26 MB |
-| [pyannote](https://github.com/pyannote/pyannote-audio) | Speaker segmentation | ~17 MB |
+| [pyannote](https://github.com/pyannote/pyannote-audio) segmentation 3.0 | Speaker segmentation | ~6 MB |
 
 Models are downloaded on-demand from the built-in model manager (**Settings → Models**).
+
+**Third-party models.** Silero VAD is © Silero Team, released under the [MIT License](https://github.com/snakers4/silero-vad/blob/master/LICENSE); `scripts/inline-silero-vad.py` inlines its 16 kHz branch for tract ONNX inference. The [pyannote segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) model is released under the MIT License; EchoNote distributes a tract-compatible rewrite of its [sherpa-onnx export](https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0) produced by `scripts/patch-pyannote-segmenter.py`. Both rewritten files are assets of release v0.6.0 (see `docs/releases/v0.6.0-model-assets.md`).
+
+**Third-party code.** The VBx speaker re-segmentation (`crates/echo-diarize/src/vbx.rs`) is a Rust port of [BUTSpeechFIT VBx](https://github.com/BUTSpeechFIT/VBx), © Lukas Burget and Mireia Diez, released under the [Apache License 2.0](crates/echo-diarize/third_party/VBx-LICENSE).
+
+**Third-party data.** The bundled PLDA model of the multilingual CAM++ embedder (`crates/echo-diarize/assets/plda_campplus_multi.plda`) is derived from the train splits of [Multilingual LibriSpeech](https://huggingface.co/datasets/facebook/multilingual_librispeech) (Pratap et al., 2020), released under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); it holds statistics only, no audio. See `crates/echo-diarize/assets/README.md`.
 
 <details>
 <summary><strong>Which models should I choose?</strong></summary>
@@ -185,6 +191,11 @@ Models are downloaded on-demand from the built-in model manager (**Settings → 
 | **Windows** | 10/11 (64-bit) | 16 GB RAM |
 | **Linux** | Ubuntu 22.04+ / AppImage-compatible | 16 GB RAM |
 | **Disk** | ~3 GB (app + base models) | ~12 GB (with full LLM) |
+| **Web engine** | Safari/WebKit 16.4+ (macOS) · WebView2 (Windows) · an up-to-date WebKitGTK (Linux) | Latest OS updates |
+
+> **macOS note.** The app installs on macOS 11 (Big Sur) and later, but capturing system audio (the other side of a call) needs macOS 12.3+.
+> On every macOS version, the interface needs **Safari 16.4 or newer** installed, because EchoNote renders with the system's WebKit and its styles rely on modern CSS.
+> Safari 16.4+ is available for Big Sur and Monterey through Software Update. If the app opens without styles, update Safari and relaunch.
 
 ---
 
@@ -221,7 +232,7 @@ Models are downloaded on-demand from the built-in model manager (**Settings → 
 | Layer | Technology |
 |-------|------------|
 | Desktop shell | [Tauri 2](https://tauri.app/) (Rust + native webview) |
-| Backend | Rust 1.88+ |
+| Backend | Rust 1.99+ |
 | Frontend | React 18, TypeScript, Tailwind CSS, i18n (en / es) |
 | Speech-to-text | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) |
 | Summaries & chat | [llama.cpp](https://github.com/ggerganov/llama.cpp) (Qwen 3) |

@@ -26,7 +26,11 @@
 mod backend;
 mod llama_cpp;
 mod llama_cpp_chat;
+mod llama_engine;
+mod prefix;
 mod shared;
+mod template;
+mod worker;
 
 pub use llama_cpp::{LlamaCppLlm, LoadOptions};
 pub use llama_cpp_chat::LlamaCppChat;

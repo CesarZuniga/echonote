@@ -26,7 +26,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useToast } from "../components/Toaster";
-import { startStreaming, stopStreaming, pauseStreaming, resumeStreaming, addNote as ipcAddNote, getMeetingId } from "../ipc/client";
+import { startStreaming, stopStreaming, pauseStreaming, resumeStreaming, addNote as ipcAddNote, getMeetingId, setMixSources as ipcSetMixSources } from "../ipc/client";
 import { isIpcError } from "../types/ipc-error";
 import type { ErrorCode } from "../types/ipc-error";
 import {
@@ -37,9 +37,14 @@ import {
   initialRecordingState,
   recordingReducer,
 } from "../state/recording";
-import type { TranscriptEvent } from "../types/streaming";
+import type { AudioSourceKind, TranscriptEvent } from "../types/streaming";
 import type { Note } from "../types/meeting";
 import type { StreamLine } from "../types/view";
+import {
+  applyChunkSpeakers,
+  applySpeakerMerges,
+  refinementSummary,
+} from "../lib/speakerRefinement";
 
 export type RecordingStats = {
   chunks: number;
@@ -57,6 +62,8 @@ export type StartOptions = {
   language: string;
   /** Enable diarization for this session. */
   diarize: boolean;
+  /** Audio capture source. Defaults to microphone. */
+  source?: AudioSourceKind;
 };
 
 export function useRecordingSession({
@@ -155,6 +162,25 @@ export function useRecordingSession({
     }
   }, [stream, toast, t]);
 
+  // One-line notice after stop (ADR 0001, Q2): no diff and no undo.
+  const notifyRefinement = useCallback(
+    (evt: TranscriptEvent) => {
+      const summary = refinementSummary(evt);
+      if (summary === null) return;
+      toast.push({
+        kind: "info",
+        message:
+          summary.segmentsMoved > 0
+            ? t("toast.speakersRefined", {
+                segments: summary.segmentsMoved,
+                speakers: summary.speakersMerged,
+              })
+            : t("toast.speakersMergedOnly", { speakers: summary.speakersMerged }),
+      });
+    },
+    [toast, t],
+  );
+
   const handleEvent = useCallback((evt: TranscriptEvent) => {
     switch (evt.type) {
       case "started":
@@ -192,6 +218,7 @@ export function useRecordingSession({
               text: text || t("live.noSpeech"),
               language: evt.language,
               rtf: evt.rtf,
+              speakerId: evt.speakerId,
               speakerSlot: evt.speakerSlot,
             },
           ];
@@ -244,11 +271,25 @@ export function useRecordingSession({
       case "resumed":
         dispatch({ type: "STREAMING_RESUMED" });
         break;
+      case "speakersMerged":
+        // Backend already rewrote the persisted segments; patch the
+        // live lines and tell the user. The meeting fetch on
+        // STREAMING_STOPPED picks up the consolidated speaker list.
+        setLines((prev) => applySpeakerMerges(prev, evt.merges));
+        notifyRefinement(evt);
+        break;
+      case "speakersReassigned":
+        // Already persisted by the recorder (set semantics, so a
+        // replayed plan is harmless). Lines evicted by the live cap
+        // are simply not patched.
+        setLines((prev) => applyChunkSpeakers(prev, evt.chunks));
+        notifyRefinement(evt);
+        break;
     }
-  }, [t]);
+  }, [t, notifyRefinement]);
 
   const start = useCallback(
-    async ({ language, diarize }: StartOptions) => {
+    async ({ language, diarize, source }: StartOptions) => {
       setLines([]);
       setStats(ZERO_STATS);
       setNotes([]);
@@ -263,6 +304,7 @@ export function useRecordingSession({
             silenceRmsThreshold: 0.005,
             diarize,
             ...(langHint.length > 0 ? { language: langHint } : {}),
+            ...(source && source !== "microphone" ? { source } : {}),
           },
           handleEvent,
         );
@@ -381,6 +423,14 @@ export function useRecordingSession({
     [stream],
   );
 
+  const setMixSources = useCallback(
+    async (micActive: boolean, sysActive: boolean): Promise<void> => {
+      if (stream.kind !== "recording" && stream.kind !== "paused") return;
+      await ipcSetMixSources(stream.sessionId, micActive, sysActive).catch(() => {});
+    },
+    [stream],
+  );
+
   const canStart = backendReady && selectCanStart(stream);
   const canStop = selectCanStop(stream);
   const canPause = selectCanPause(stream);
@@ -418,5 +468,6 @@ export function useRecordingSession({
     addNote,
     dismissError,
     reset,
+    setMixSources,
   };
 }

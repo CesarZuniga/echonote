@@ -139,7 +139,9 @@ impl From<SummarizeMeetingError> for IpcError {
             SummarizeMeetingError::NotFound(_) => IpcError::not_found(e.to_string()),
             SummarizeMeetingError::EmptyTranscript(_) => IpcError::invalid_input(e.to_string()),
             SummarizeMeetingError::InvalidTemplate(_) => IpcError::invalid_input(e.to_string()),
-            SummarizeMeetingError::Llm(_) => IpcError::new(ErrorCode::Llm, e.to_string()),
+            SummarizeMeetingError::ContextTooSmall(_) | SummarizeMeetingError::Llm(_) => {
+                IpcError::new(ErrorCode::Llm, e.to_string())
+            }
             SummarizeMeetingError::Storage(_) => IpcError::storage(e.to_string()),
         }
     }
@@ -151,6 +153,7 @@ impl From<AskAboutMeetingError> for IpcError {
             AskAboutMeetingError::NotFound(_) => IpcError::not_found(e.to_string()),
             AskAboutMeetingError::EmptyQuestion => IpcError::invalid_input(e.to_string()),
             AskAboutMeetingError::EmptyTranscript(_) => IpcError::invalid_input(e.to_string()),
+            AskAboutMeetingError::PromptTooLarge => IpcError::invalid_input(e.to_string()),
             AskAboutMeetingError::Chat(_) => IpcError::new(ErrorCode::Llm, e.to_string()),
             AskAboutMeetingError::Storage(_) => IpcError::storage(e.to_string()),
         }

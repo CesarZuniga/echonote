@@ -120,7 +120,7 @@ Estos principios son la constitución del proyecto. Cuando una decisión técnic
 | Framework de app | Tauri | 2.0 |
 | Backend | Rust | 1.75 (edición 2021) |
 | Frontend | React + TypeScript | 18.3 + TS 5.5 |
-| Estilos | Tailwind CSS + shadcn/ui | Tailwind 3.4 |
+| Estilos | Tailwind CSS + shadcn/ui | Tailwind 4 |
 | Estado frontend | Zustand + TanStack Query | Zustand 4.5 + TQ 5 |
 | Runtime ASR | whisper.cpp via `whisper-rs` | whisper-rs 0.13 |
 | Runtime LLM | llama.cpp via `llama-cpp-rs` | 0.1.x |
@@ -174,7 +174,7 @@ Estos principios son la constitución del proyecto. Cuando una decisión técnic
 
 #### 3.2.4 Tailwind CSS + shadcn/ui sobre MUI/Chakra
 
-**Decisión:** Tailwind 3.4 con componentes de shadcn/ui copiados al repositorio.
+**Decisión:** Tailwind 4 con componentes de shadcn/ui copiados al repositorio.
 
 **Justificación:**
 - shadcn/ui no es una librería npm; son componentes que copias y posees. Sin lock-in.
@@ -1106,6 +1106,7 @@ fn refinement_completes_in_under_90s_for_30min_audio() { ... }
 - Separate audio track capture (mic and system)
 - Hybrid streaming + refinement pipeline
 - Speaker diarization via ONNX embeddings (3D-Speaker) over pyannote
+- Offline speaker re-segmentation from an in-memory embedding log, no audio retention (proposed: [ADR 0001](adr/0001-offline-speaker-resegmentation.md))
 - Zustand + TanStack Query over Redux
 - SQLite + FTS5 with optional SQLCipher
 - Clean Architecture with ports and adapters

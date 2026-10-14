@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
+use crate::ports::chat::{render_chatml, ChatMessage};
 use crate::DomainError;
 
 /// Knobs the application layer can pass to the LLM. Defaults are
@@ -61,6 +62,8 @@ pub struct GenerateOptions {
     /// Optional list of strings that, when produced, terminate
     /// decoding. Useful to stop on `"\n```"` after a JSON block, for
     /// instance. The matching string is *not* included in the output.
+    /// Template terminators (`<|im_end|>`, `<turn|>`, …) do not belong
+    /// here: adapters add the ones of the model they loaded.
     pub stop: Vec<String>,
 }
 
@@ -79,6 +82,29 @@ impl Default for GenerateOptions {
     }
 }
 
+/// Context window assumed by [`LlmModel::context_window`] and
+/// [`crate::ChatAssistant::context_window`] when an adapter does not
+/// report its own. Matches the default `n_ctx` of the llama.cpp adapter.
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 8_192;
+
+/// Conservative token estimate: one token per 2 UTF-8 bytes, rounded up.
+///
+/// Byte-level BPE tokenizers split accented and non-Latin characters
+/// into several byte tokens, so a character count can undercount by a
+/// wide margin. Measured with the Qwen3-8B tokenizer: natural Spanish
+/// and English run at 3.5-5 bytes per token, but a text made only of
+/// accented vowels (`áéíóúñ`) costs about one token per 2.1 bytes, 2.5x
+/// more than `chars / 3`. Two bytes per token stays at or above every
+/// measured sample, including that worst case. Over-counting is the safe
+/// direction for a budget: a prompt sized with this estimate can only
+/// end up smaller than the window, never larger. Adapters with a real
+/// tokenizer should override `count_tokens` and may fall back to this
+/// function when tokenization fails.
+#[must_use]
+pub fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(2)
+}
+
 /// Async port over a local large language model.
 ///
 /// Implementors are expected to be cheap to clone (`Arc` internally)
@@ -91,11 +117,30 @@ pub trait LlmModel: Send + Sync {
     /// Examples: `"qwen2.5-7b-instruct-q4_k_m"`, `"llama-3.2-3b-instruct-q4_k_m"`.
     fn model_id(&self) -> &str;
 
-    /// Generate a completion for `prompt`. The prompt is expected to
-    /// already include any chat template wrapping (`<|im_start|>` for
-    /// Qwen, `<s>[INST]` for Llama, …) — the adapter passes it
-    /// through verbatim so the use-case layer keeps full control over
-    /// the conversation shape.
+    /// Size of the context window in tokens: prompt plus generated
+    /// output must fit in it. Use cases derive their prompt budget from
+    /// this value instead of a fixed character cap.
+    ///
+    /// The default ([`DEFAULT_CONTEXT_WINDOW`]) suits fakes and adapters
+    /// that cannot introspect their model.
+    fn context_window(&self) -> u32 {
+        DEFAULT_CONTEXT_WINDOW
+    }
+
+    /// Number of tokens `text` occupies for this model.
+    ///
+    /// The default is [`estimate_tokens`], a deliberately pessimistic
+    /// bytes/2 estimate, so budgets built on it stay safe when no real
+    /// tokenizer is available. Adapters SHOULD override it with the
+    /// model's own tokenizer.
+    fn count_tokens(&self, text: &str) -> usize {
+        estimate_tokens(text)
+    }
+
+    /// Generate a completion for a raw `prompt`. The prompt is passed
+    /// to the model verbatim: it must already carry whatever framing the
+    /// model needs. Prefer [`Self::generate_chat`], which lets the adapter
+    /// apply the model's own chat template.
     ///
     /// Returns the decoded text, **without** the prompt prefix and
     /// without any trailing stop-sequence match.
@@ -119,11 +164,47 @@ pub trait LlmModel: Send + Sync {
         let text = self.generate(prompt, options).await?;
         Ok(Box::pin(futures::stream::once(async move { Ok(text) })))
     }
+
+    /// Generate a completion for a conversation. The adapter renders
+    /// `messages` with the chat template of the model it loaded and adds
+    /// that model's own stop sequences to `options.stop`.
+    ///
+    /// The default renders [`render_chatml`] and calls [`Self::generate`],
+    /// which keeps fakes and template-less adapters working.
+    async fn generate_chat(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerateOptions,
+    ) -> Result<String, DomainError> {
+        self.generate(&render_chatml(messages), options).await
+    }
+
+    /// Streaming counterpart of [`Self::generate_chat`]; same default
+    /// rendering, delegating to [`Self::generate_stream`].
+    async fn generate_chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerateOptions,
+    ) -> Result<BoxStream<'static, Result<String, DomainError>>, DomainError> {
+        self.generate_stream(&render_chatml(messages), options)
+            .await
+    }
+
+    /// Number of tokens `messages` occupies once rendered the way
+    /// [`Self::generate_chat`] renders them (framing and assistant prime
+    /// included). Budgets MUST use this, not [`Self::count_tokens`] on
+    /// their own concatenation, so they follow the model's template.
+    ///
+    /// The default counts the [`render_chatml`] rendering.
+    fn count_chat_tokens(&self, messages: &[ChatMessage]) -> usize {
+        self.count_tokens(&render_chatml(messages))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::chat::render_chatml;
 
     #[test]
     fn default_options_are_structured_output_friendly() {
@@ -136,6 +217,101 @@ mod tests {
         assert!((opts.top_p - 0.95).abs() < f32::EPSILON);
         assert!(opts.seed.is_none());
         assert!(opts.stop.is_empty());
+    }
+
+    struct MinimalLlm;
+
+    #[async_trait]
+    impl LlmModel for MinimalLlm {
+        fn model_id(&self) -> &str {
+            "minimal"
+        }
+
+        async fn generate(&self, _: &str, _: &GenerateOptions) -> Result<String, DomainError> {
+            Ok(String::new())
+        }
+    }
+
+    struct EchoLlm;
+
+    #[async_trait]
+    impl LlmModel for EchoLlm {
+        fn model_id(&self) -> &str {
+            "echo"
+        }
+
+        async fn generate(&self, prompt: &str, _: &GenerateOptions) -> Result<String, DomainError> {
+            Ok(prompt.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_chat_defaults_to_the_chatml_rendering() {
+        let messages = [ChatMessage::system("S"), ChatMessage::user("U")];
+        let out = EchoLlm
+            .generate_chat(&messages, &GenerateOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(out, render_chatml(&messages));
+        assert!(out.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[tokio::test]
+    async fn generate_chat_stream_defaults_to_the_chatml_rendering() {
+        use futures::StreamExt;
+        let messages = [ChatMessage::user("U")];
+        let mut stream = EchoLlm
+            .generate_chat_stream(&messages, &GenerateOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            render_chatml(&messages)
+        );
+    }
+
+    #[test]
+    fn count_chat_tokens_defaults_to_counting_the_rendered_prompt() {
+        let messages = [ChatMessage::user("abcdefg")];
+        assert_eq!(
+            EchoLlm.count_chat_tokens(&messages),
+            EchoLlm.count_tokens(&render_chatml(&messages))
+        );
+    }
+
+    #[test]
+    fn token_budget_defaults_are_conservative() {
+        // Fakes that don't override the budget methods must still get a
+        // usable window and an estimate that errs on the high side.
+        let llm = MinimalLlm;
+        assert_eq!(llm.context_window(), 8_192);
+        assert_eq!(llm.count_tokens("abcdefg"), 4);
+        assert_eq!(llm.count_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_is_half_the_utf8_bytes_rounded_up() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abc"), 2);
+        // Accented letters weigh two bytes each: 6 chars, 12 bytes.
+        assert_eq!(estimate_tokens("áéíóúñ"), 6);
+    }
+
+    #[test]
+    fn estimate_never_drops_below_the_previous_chars_over_three() {
+        for text in [
+            "",
+            "a",
+            "hello world",
+            "Además, la configuración",
+            "日本語のテキスト",
+            "Reunión de planificación 🚀🚀 ñandú",
+        ] {
+            // The estimator used to be chars/3; it must never undercount
+            // relative to that, which is the floor callers were tuned on.
+            let char_floor = text.chars().count().div_ceil(3);
+            assert!(estimate_tokens(text) >= char_floor, "{text:?}");
+        }
     }
 
     #[test]

@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use echo_domain::{
     AudioFormat, CreateMeeting, DomainError, FinalizeMeeting, Meeting, MeetingId, MeetingSearchHit,
-    MeetingStore, MeetingSummary, Note, NoteId, Segment, SegmentId, Speaker, SpeakerId, Summary,
-    SummaryContent, SummaryId,
+    MeetingStore, MeetingSummary, Note, NoteId, ReassignOutcome, Segment, SegmentHit, SegmentId,
+    SegmentRetriever, Speaker, SpeakerId, SpeakerReassignment, Summary, SummaryContent, SummaryId,
 };
 
 /// Embedded migrations (`crates/echo-storage/migrations/`).
@@ -197,6 +197,180 @@ impl MeetingStore for SqliteMeetingStore {
             .await
             .map_err(map_sqlx("rename speaker"))?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn merge_speakers(
+        &self,
+        meeting_id: MeetingId,
+        absorbed: SpeakerId,
+        surviving: SpeakerId,
+    ) -> Result<bool, DomainError> {
+        // Two-step in a single transaction so we never end up with
+        // segments pointing at a deleted speaker row even if a crash
+        // wedges the connection between statements.
+        let meeting_str = meeting_id.to_string();
+        let absorbed_str = absorbed.0.to_string();
+        let surviving_str = surviving.0.to_string();
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx("begin tx"))?;
+
+        // Bail out cleanly if `surviving` is not actually a speaker on
+        // this meeting — applying the rewrite would orphan segments.
+        let surviving_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM speakers WHERE id = ? AND meeting_id = ?")
+                .bind(&surviving_str)
+                .bind(&meeting_str)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(map_sqlx("verify surviving speaker"))?;
+        if surviving_exists == 0 {
+            tx.rollback().await.map_err(map_sqlx("rollback tx"))?;
+            return Ok(false);
+        }
+
+        let seg_update = sqlx::query(
+            "UPDATE segments SET speaker_id = ? \
+             WHERE meeting_id = ? AND speaker_id = ?",
+        )
+        .bind(&surviving_str)
+        .bind(&meeting_str)
+        .bind(&absorbed_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx("rewrite segments speaker_id"))?;
+
+        let retired =
+            retire_speaker(&mut tx, &meeting_str, &absorbed_str, Some(&surviving_str)).await?;
+
+        tx.commit().await.map_err(map_sqlx("commit tx"))?;
+        Ok(seg_update.rows_affected() > 0
+            || matches!(retired, RetireOutcome::Deleted | RetireOutcome::LabelMoved))
+    }
+
+    async fn reassign_speakers(
+        &self,
+        meeting_id: MeetingId,
+        plan: &SpeakerReassignment,
+    ) -> Result<ReassignOutcome, DomainError> {
+        let meeting = meeting_id.to_string();
+        let mut tx = self.pool.begin().await.map_err(map_sqlx("begin tx"))?;
+
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings WHERE id = ?")
+            .bind(&meeting)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx("verify meeting"))?;
+        if exists == 0 {
+            return Err(DomainError::NotFound {
+                entity: "meeting",
+                id: meeting,
+            });
+        }
+
+        // Dropping `tx` on any early `?` rolls the whole plan back.
+        let mut out = ReassignOutcome::default();
+        for created in &plan.created {
+            let inserted = sqlx::query(
+                "INSERT INTO speakers (id, meeting_id, slot, label) VALUES (?, ?, ?, NULL) \
+                 ON CONFLICT(id) DO NOTHING",
+            )
+            .bind(created.id.0.to_string())
+            .bind(&meeting)
+            .bind(i64::from(created.slot))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx("insert reassigned speaker"))?;
+            if inserted.rows_affected() == 0 {
+                // Replay of this plan, unless the id belongs elsewhere.
+                ensure_not_foreign(&mut tx, &meeting, created.id).await?;
+            }
+            out.speakers_created += u32::try_from(inserted.rows_affected()).unwrap_or(u32::MAX);
+        }
+
+        // Every speaker a segment or a recipient points at must belong to
+        // this meeting (created rows included, now that they exist).
+        let targets = plan
+            .segments
+            .iter()
+            .filter_map(|s| s.speaker_id)
+            .chain(plan.retired.iter().filter_map(|r| r.majority_recipient));
+        for speaker in targets {
+            let owned: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM speakers WHERE id = ? AND meeting_id = ?")
+                    .bind(speaker.0.to_string())
+                    .bind(&meeting)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(map_sqlx("verify reassigned speaker"))?;
+            if owned == 0 {
+                return Err(DomainError::Invariant(format!(
+                    "speaker {speaker} is not part of meeting {meeting}"
+                )));
+            }
+        }
+
+        for change in &plan.segments {
+            let segment = change.segment_id.0.to_string();
+            let current: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT speaker_id FROM segments WHERE id = ? AND meeting_id = ?")
+                    .bind(&segment)
+                    .bind(&meeting)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(map_sqlx("read reassigned segment"))?;
+            let Some((current,)) = current else {
+                return Err(DomainError::Invariant(format!(
+                    "segment {segment} is not part of meeting {meeting}"
+                )));
+            };
+            let target = change.speaker_id.map(|id| id.0.to_string());
+            if current == target {
+                continue;
+            }
+            sqlx::query("UPDATE segments SET speaker_id = ? WHERE id = ? AND meeting_id = ?")
+                .bind(&target)
+                .bind(&segment)
+                .bind(&meeting)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx("reassign segment speaker"))?;
+            out.segments_updated += 1;
+        }
+
+        for retirement in &plan.retired {
+            // A retired id unknown to this meeting is a replay (already
+            // deleted) unless it belongs to another meeting.
+            ensure_not_foreign(&mut tx, &meeting, retirement.speaker).await?;
+            let recipient = retirement.majority_recipient.map(|id| id.0.to_string());
+            match retire_speaker(
+                &mut tx,
+                &meeting,
+                &retirement.speaker.0.to_string(),
+                recipient.as_deref(),
+            )
+            .await?
+            {
+                RetireOutcome::Deleted => out.speakers_deleted += 1,
+                RetireOutcome::LabelMoved => {
+                    out.speakers_deleted += 1;
+                    out.labels_moved += 1;
+                }
+                // Already retired by an earlier apply, or kept to
+                // preserve a label or remaining segments.
+                RetireOutcome::Missing | RetireOutcome::Kept => {}
+            }
+        }
+
+        tx.commit().await.map_err(map_sqlx("commit tx"))?;
+        debug!(
+            %meeting_id,
+            segments = out.segments_updated,
+            created = out.speakers_created,
+            deleted = out.speakers_deleted,
+            labels_moved = out.labels_moved,
+            "speakers reassigned"
+        );
+        Ok(out)
     }
 
     async fn rename_meeting(
@@ -759,6 +933,115 @@ fn sanitize_fts_snippet(raw: &str) -> String {
         .replace(CLOSE_PH, "</mark>")
 }
 
+/// Retrieval over the same FTS5 index as [`MeetingStore::search`], scoped
+/// to one meeting.
+#[async_trait]
+impl SegmentRetriever for SqliteMeetingStore {
+    async fn search_segments(
+        &self,
+        meeting_id: MeetingId,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<SegmentHit>, DomainError> {
+        let Some(match_expr) = build_retrieval_query(query) else {
+            return Ok(Vec::new());
+        };
+
+        // `bm25()` only resolves with the FTS table in the FROM clause of
+        // the same SELECT as the MATCH (see `search`). The meeting filter
+        // is applied on the joined `segments` row.
+        let rows = sqlx::query(
+            r#"
+            SELECT  s.id, bm25(segments_fts) AS rank
+              FROM segments_fts
+              JOIN segments s ON s.rowid = segments_fts.rowid
+             WHERE segments_fts MATCH ?
+               AND s.meeting_id = ?
+          ORDER BY rank ASC
+             LIMIT ?
+            "#,
+        )
+        .bind(&match_expr)
+        .bind(meeting_id.0.to_string())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx("search segments"))?;
+
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get(0);
+                Ok(SegmentHit {
+                    segment_id: SegmentId(parse_uuid(&id_text, "segment")?),
+                    rank: row.get(1),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Words too common to discriminate between segments. Matching on them
+/// would (with OR semantics) retrieve nearly every segment of the meeting.
+/// Spanish and English, lower-case, both with and without accents.
+const RETRIEVAL_STOPWORDS: &[&str] = &[
+    // Spanish
+    "que", "qué", "como", "cómo", "cual", "cuál", "cuales", "cuáles", "cuando", "cuándo", "donde",
+    "dónde", "quien", "quién", "quienes", "quiénes", "cuanto", "cuánto", "por", "para", "con",
+    "sin", "sobre", "entre", "hacia", "desde", "hasta", "los", "las", "del", "una", "uno", "unos",
+    "unas", "este", "esta", "esto", "estos", "estas", "ese", "esa", "eso", "esos", "esas", "aquel",
+    "aquella", "aquello", "mas", "más", "pero", "porque", "cuyo", "fue", "fueron", "era", "eran",
+    "ser", "son", "soy", "eres", "somos", "está", "están", "estan", "estaba", "estar", "han",
+    "has", "hay", "hizo", "hacer", "ha", "muy", "tan", "tambien", "también", "ahora", "alli",
+    "allí", "aqui", "aquí", "ver", "dijo", "dice", "dicen", "sido", "tiene", "tienen", "tenia",
+    "tenía", "puede", "pueden", "sus", "mis", "tus", "nos", "les", "algo", "alguien", "nada",
+    "todo", "todos", "toda", "todas", "reunion", "reunión", // English
+    "the", "and", "for", "are", "was", "were", "have", "had", "not", "but", "you", "your", "with",
+    "that", "this", "these", "those", "from", "what", "when", "where", "which", "who", "whom",
+    "whose", "why", "how", "does", "did", "can", "could", "would", "should", "will", "about",
+    "into", "than", "then", "there", "their", "they", "them", "she", "his", "her", "our", "any",
+    "all", "been", "being", "its", "also", "just", "said", "say", "says", "tell", "meeting",
+];
+
+/// Shortest token worth searching for.
+const RETRIEVAL_MIN_TOKEN_CHARS: usize = 3;
+
+/// Tokens at least this long also match longer words that start with them
+/// (plurals, gender and verb endings: "decisión" finds "decisiones").
+const RETRIEVAL_PREFIX_MIN_CHARS: usize = 5;
+
+/// Turn a natural-language question into an FTS5 `MATCH` expression with
+/// OR semantics, or `None` when nothing searchable is left.
+///
+/// The text is lower-cased and split on every non-alphanumeric character;
+/// short tokens and [`RETRIEVAL_STOPWORDS`] are dropped and repeats
+/// collapsed. Each remaining token is emitted as a quoted FTS5 string (so
+/// operators and column filters in the user's text are inert; only
+/// alphanumerics can reach the expression) and long tokens get a prefix
+/// `*`. The result is always passed as a bound parameter.
+fn build_retrieval_query(raw: &str) -> Option<String> {
+    let lowered = raw.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let terms: Vec<String> = lowered
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= RETRIEVAL_MIN_TOKEN_CHARS)
+        .filter(|t| !RETRIEVAL_STOPWORDS.contains(t))
+        .filter(|t| seen.insert(*t))
+        .map(|t| {
+            let star = if t.chars().count() >= RETRIEVAL_PREFIX_MIN_CHARS {
+                "*"
+            } else {
+                ""
+            };
+            format!("\"{t}\"{star}")
+        })
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
 /// Returns `None` for empty / whitespace-only / all-stripped inputs
 /// so the caller can short-circuit to "no hits" without ever asking
 /// SQLite. That matches the search port contract.
@@ -786,6 +1069,104 @@ fn sanitize_fts_query(raw: &str) -> Option<String> {
     } else {
         Some(out)
     }
+}
+
+/// [`DomainError::Invariant`] when `speaker` is a row of a meeting other
+/// than `meeting`. A speaker unknown everywhere is not an error.
+async fn ensure_not_foreign(
+    conn: &mut sqlx::SqliteConnection,
+    meeting: &str,
+    speaker: SpeakerId,
+) -> Result<(), DomainError> {
+    let foreign: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM speakers WHERE id = ? AND meeting_id <> ?")
+            .bind(speaker.0.to_string())
+            .bind(meeting)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_sqlx("verify speaker ownership"))?;
+    if foreign > 0 {
+        return Err(DomainError::Invariant(format!(
+            "speaker {speaker} is not part of meeting {meeting}"
+        )));
+    }
+    Ok(())
+}
+
+/// What [`retire_speaker`] did with a speaker row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetireOutcome {
+    /// No such speaker on this meeting.
+    Missing,
+    /// The row still has segments or a label nobody could take; it stays.
+    Kept,
+    /// The row was deleted (it had no label).
+    Deleted,
+    /// The label moved to the recipient and the row was deleted.
+    LabelMoved,
+}
+
+/// Retire a speaker inside an open transaction, applying the label rule of
+/// ADR 0001 (Q1): a user label is never overwritten or destroyed.
+///
+/// - A row that still has segments is kept.
+/// - An unlabelled row is deleted.
+/// - A labelled row passes its label to `recipient` only when the
+///   recipient's label is `NULL`, then is deleted; otherwise it is kept with
+///   zero segments so the user-authored name survives.
+async fn retire_speaker(
+    conn: &mut sqlx::SqliteConnection,
+    meeting: &str,
+    retired: &str,
+    recipient: Option<&str>,
+) -> Result<RetireOutcome, DomainError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT label FROM speakers WHERE id = ? AND meeting_id = ?")
+            .bind(retired)
+            .bind(meeting)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx("read retired speaker"))?;
+    let Some((label,)) = row else {
+        return Ok(RetireOutcome::Missing);
+    };
+    let segments: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM segments WHERE meeting_id = ? AND speaker_id = ?")
+            .bind(meeting)
+            .bind(retired)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_sqlx("count retired speaker segments"))?;
+    if segments > 0 {
+        return Ok(RetireOutcome::Kept);
+    }
+    let outcome = match (label, recipient) {
+        (None, _) => RetireOutcome::Deleted,
+        (Some(label), Some(recipient)) => {
+            let moved = sqlx::query(
+                "UPDATE speakers SET label = ? \
+                 WHERE id = ? AND meeting_id = ? AND label IS NULL",
+            )
+            .bind(&label)
+            .bind(recipient)
+            .bind(meeting)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx("move retired speaker label"))?;
+            if moved.rows_affected() == 0 {
+                return Ok(RetireOutcome::Kept);
+            }
+            RetireOutcome::LabelMoved
+        }
+        (Some(_), None) => return Ok(RetireOutcome::Kept),
+    };
+    sqlx::query("DELETE FROM speakers WHERE id = ? AND meeting_id = ?")
+        .bind(retired)
+        .bind(meeting)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx("delete retired speaker"))?;
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -878,8 +1259,14 @@ mod tests {
             .await
             .unwrap();
         let s = segment(0, 500, "once");
-        store.append_segments(id, &[s.clone()]).await.unwrap();
-        store.append_segments(id, &[s.clone()]).await.unwrap();
+        store
+            .append_segments(id, std::slice::from_ref(&s))
+            .await
+            .unwrap();
+        store
+            .append_segments(id, std::slice::from_ref(&s))
+            .await
+            .unwrap();
         finalize_meeting(&store, id).await;
         let listed = store.list(0).await.unwrap();
         assert_eq!(listed[0].segment_count, 1);
@@ -1104,6 +1491,319 @@ mod tests {
 
         store.delete(id).await.unwrap();
         assert!(store.list_speakers(id).await.unwrap().is_empty());
+    }
+
+    // ---------- merge_speakers label rule (ADR 0001, Q1) -------------------
+
+    /// Seed a meeting with two speakers (slots 0 and 1), optional labels,
+    /// and one segment per speaker. Returns `(meeting, a, b, seg_a, seg_b)`.
+    async fn seed_two_speakers(
+        store: &SqliteMeetingStore,
+        label_a: Option<&str>,
+        label_b: Option<&str>,
+    ) -> (MeetingId, Speaker, Speaker, Segment, Segment) {
+        let id = MeetingId::new();
+        store
+            .create(CreateMeeting {
+                id,
+                title: "merge".into(),
+                input_format: fmt(),
+            })
+            .await
+            .unwrap();
+        let a = Speaker {
+            label: label_a.map(str::to_owned),
+            ..Speaker::anonymous(0)
+        };
+        let b = Speaker {
+            label: label_b.map(str::to_owned),
+            ..Speaker::anonymous(1)
+        };
+        store.upsert_speaker(id, &a).await.unwrap();
+        store.upsert_speaker(id, &b).await.unwrap();
+        let mut seg_a = segment(0, 1_000, "uno");
+        seg_a.speaker_id = Some(a.id);
+        let mut seg_b = segment(1_000, 2_000, "dos");
+        seg_b.speaker_id = Some(b.id);
+        store
+            .append_segments(id, &[seg_a.clone(), seg_b.clone()])
+            .await
+            .unwrap();
+        (id, a, b, seg_a, seg_b)
+    }
+
+    #[tokio::test]
+    async fn merge_of_unlabelled_speaker_rewrites_segments_and_deletes_row() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, a, b, _, seg_b) = seed_two_speakers(&store, None, None).await;
+
+        assert!(store.merge_speakers(id, b.id, a.id).await.unwrap());
+
+        let full = store.get(id).await.unwrap().unwrap();
+        assert_eq!(full.speakers.len(), 1);
+        assert_eq!(full.speakers[0].id, a.id);
+        let moved = full.segments.iter().find(|s| s.id == seg_b.id).unwrap();
+        assert_eq!(moved.speaker_id, Some(a.id));
+    }
+
+    #[tokio::test]
+    async fn merge_moves_absorbed_label_to_unlabelled_survivor() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, a, b, _, _) = seed_two_speakers(&store, None, Some("Bea")).await;
+
+        assert!(store.merge_speakers(id, b.id, a.id).await.unwrap());
+
+        let speakers = store.list_speakers(id).await.unwrap();
+        assert_eq!(
+            speakers.len(),
+            1,
+            "absorbed row is deleted once its label moved"
+        );
+        assert_eq!(speakers[0].id, a.id);
+        assert_eq!(speakers[0].label.as_deref(), Some("Bea"));
+    }
+
+    #[tokio::test]
+    async fn merge_keeps_labelled_absorbed_row_when_survivor_is_labelled() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, a, b, _, seg_b) = seed_two_speakers(&store, Some("Ana"), Some("Bea")).await;
+
+        assert!(store.merge_speakers(id, b.id, a.id).await.unwrap());
+
+        let full = store.get(id).await.unwrap().unwrap();
+        let labels: Vec<_> = full
+            .speakers
+            .iter()
+            .map(|s| (s.id, s.label.clone()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![(a.id, Some("Ana".into())), (b.id, Some("Bea".into()))],
+            "no user label is overwritten or destroyed"
+        );
+        let moved = full.segments.iter().find(|s| s.id == seg_b.id).unwrap();
+        assert_eq!(moved.speaker_id, Some(a.id), "segments still move");
+    }
+
+    #[tokio::test]
+    async fn merge_of_two_labelled_speakers_with_nothing_to_move_reports_no_change() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, a, b, _, _) = seed_two_speakers(&store, Some("Ana"), Some("Bea")).await;
+        assert!(store.merge_speakers(id, b.id, a.id).await.unwrap());
+        // b is now a labelled row with zero segments; merging it again
+        // moves nothing and keeps it.
+        assert!(!store.merge_speakers(id, b.id, a.id).await.unwrap());
+        assert_eq!(store.list_speakers(id).await.unwrap().len(), 2);
+    }
+
+    // ---------- retire_speaker branches ------------------------------------
+
+    async fn retire_in(
+        store: &SqliteMeetingStore,
+        meeting: MeetingId,
+        retired: SpeakerId,
+        recipient: Option<SpeakerId>,
+    ) -> RetireOutcome {
+        let mut tx = store.pool.begin().await.unwrap();
+        let recipient = recipient.map(|r| r.0.to_string());
+        let out = retire_speaker(
+            &mut tx,
+            &meeting.to_string(),
+            &retired.0.to_string(),
+            recipient.as_deref(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn retire_speaker_covers_every_branch() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, a, b, _, _) = seed_two_speakers(&store, None, Some("Bea")).await;
+
+        assert_eq!(
+            retire_in(&store, id, SpeakerId::new(), Some(a.id)).await,
+            RetireOutcome::Missing
+        );
+        assert_eq!(
+            retire_in(&store, id, b.id, Some(a.id)).await,
+            RetireOutcome::Kept,
+            "b still owns a segment"
+        );
+        sqlx::query("UPDATE segments SET speaker_id = ? WHERE speaker_id = ?")
+            .bind(a.id.0.to_string())
+            .bind(b.id.0.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            retire_in(&store, id, b.id, None).await,
+            RetireOutcome::Kept,
+            "a labelled row without a recipient keeps its label"
+        );
+        assert_eq!(
+            retire_in(&store, id, b.id, Some(a.id)).await,
+            RetireOutcome::LabelMoved
+        );
+        let speakers = store.list_speakers(id).await.unwrap();
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].label.as_deref(), Some("Bea"));
+    }
+
+    // ---------- reassign_speakers (ADR 0001, D5) ---------------------------
+
+    fn retire(speaker: SpeakerId, to: Option<SpeakerId>) -> echo_domain::SpeakerRetirement {
+        echo_domain::SpeakerRetirement {
+            speaker,
+            majority_recipient: to,
+        }
+    }
+
+    fn move_to(seg: &Segment, to: SpeakerId) -> echo_domain::SegmentSpeaker {
+        echo_domain::SegmentSpeaker {
+            segment_id: seg.id,
+            speaker_id: Some(to),
+        }
+    }
+
+    #[tokio::test]
+    async fn reassign_creates_speaker_moves_segments_and_retires_empty_rows() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, a, b, seg_a, seg_b) = seed_two_speakers(&store, None, None).await;
+        let fresh = echo_domain::SpeakerRef {
+            id: SpeakerId::new(),
+            slot: 2,
+        };
+        let plan = SpeakerReassignment {
+            created: vec![fresh],
+            retired: vec![retire(b.id, Some(a.id))],
+            segments: vec![move_to(&seg_a, fresh.id), move_to(&seg_b, a.id)],
+        };
+
+        let out = store.reassign_speakers(id, &plan).await.unwrap();
+        assert_eq!(
+            out,
+            ReassignOutcome {
+                segments_updated: 2,
+                speakers_created: 1,
+                speakers_deleted: 1,
+                labels_moved: 0,
+            }
+        );
+        let full = store.get(id).await.unwrap().unwrap();
+        let ids: Vec<_> = full.speakers.iter().map(|s| (s.id, s.slot)).collect();
+        assert_eq!(ids, vec![(a.id, 0), (fresh.id, 2)]);
+        let speaker_of = |seg: &Segment| {
+            full.segments
+                .iter()
+                .find(|s| s.id == seg.id)
+                .unwrap()
+                .speaker_id
+        };
+        assert_eq!(speaker_of(&seg_a), Some(fresh.id));
+        assert_eq!(speaker_of(&seg_b), Some(a.id));
+
+        // Replay: same state, nothing new written.
+        let again = store.reassign_speakers(id, &plan).await.unwrap();
+        assert_eq!(again, ReassignOutcome::default());
+        assert_eq!(store.get(id).await.unwrap().unwrap(), full);
+    }
+
+    #[tokio::test]
+    async fn reassign_moves_retired_label_only_to_an_unlabelled_recipient() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, a, b, _, seg_b) = seed_two_speakers(&store, None, Some("Bea")).await;
+        let plan = SpeakerReassignment {
+            created: vec![],
+            retired: vec![retire(b.id, Some(a.id))],
+            segments: vec![move_to(&seg_b, a.id)],
+        };
+        let out = store.reassign_speakers(id, &plan).await.unwrap();
+        assert_eq!((out.labels_moved, out.speakers_deleted), (1, 1));
+        let speakers = store.list_speakers(id).await.unwrap();
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].label.as_deref(), Some("Bea"));
+
+        let (id, a, b, _, seg_b) = seed_two_speakers(&store, Some("Ana"), Some("Bea")).await;
+        let plan = SpeakerReassignment {
+            created: vec![],
+            retired: vec![retire(b.id, Some(a.id))],
+            segments: vec![move_to(&seg_b, a.id)],
+        };
+        let out = store.reassign_speakers(id, &plan).await.unwrap();
+        assert_eq!((out.labels_moved, out.speakers_deleted), (0, 0));
+        let labels: Vec<_> = store
+            .list_speakers(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.label)
+            .collect();
+        assert_eq!(labels, vec![Some("Ana".into()), Some("Bea".into())]);
+    }
+
+    #[tokio::test]
+    async fn reassign_rejects_foreign_ids_and_writes_nothing() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, a, b, seg_a, seg_b) = seed_two_speakers(&store, None, None).await;
+        let (other, x, _, seg_x, _) = seed_two_speakers(&store, None, None).await;
+        let before = store.get(id).await.unwrap().unwrap();
+
+        // A segment of another meeting.
+        let plan = SpeakerReassignment {
+            created: vec![],
+            retired: vec![],
+            segments: vec![move_to(&seg_b, a.id), move_to(&seg_x, a.id)],
+        };
+        assert!(matches!(
+            store.reassign_speakers(id, &plan).await,
+            Err(DomainError::Invariant(_))
+        ));
+        // A speaker of another meeting.
+        let plan = SpeakerReassignment {
+            created: vec![],
+            retired: vec![retire(b.id, Some(x.id))],
+            segments: vec![move_to(&seg_a, b.id), move_to(&seg_b, x.id)],
+        };
+        assert!(matches!(
+            store.reassign_speakers(id, &plan).await,
+            Err(DomainError::Invariant(_))
+        ));
+        assert_eq!(store.get(id).await.unwrap().unwrap(), before);
+        assert_eq!(store.list_speakers(other).await.unwrap().len(), 2);
+
+        // A retired speaker of another meeting.
+        let plan = SpeakerReassignment {
+            created: vec![],
+            retired: vec![retire(x.id, Some(a.id))],
+            segments: vec![move_to(&seg_b, a.id)],
+        };
+        assert!(matches!(
+            store.reassign_speakers(id, &plan).await,
+            Err(DomainError::Invariant(_))
+        ));
+        // A created id that already belongs to another meeting.
+        let plan = SpeakerReassignment {
+            created: vec![echo_domain::SpeakerRef { id: x.id, slot: 5 }],
+            retired: vec![],
+            segments: vec![move_to(&seg_b, a.id)],
+        };
+        assert!(matches!(
+            store.reassign_speakers(id, &plan).await,
+            Err(DomainError::Invariant(_))
+        ));
+        assert_eq!(store.get(id).await.unwrap().unwrap(), before);
+        assert_eq!(store.list_speakers(other).await.unwrap().len(), 2);
+
+        // Unknown meeting.
+        assert!(matches!(
+            store
+                .reassign_speakers(MeetingId::new(), &SpeakerReassignment::default())
+                .await,
+            Err(DomainError::NotFound { .. })
+        ));
     }
 
     // ---------- FTS5 search (Sprint 1 day 8) -------------------------------
@@ -1462,5 +2162,202 @@ mod tests {
         let listed = store.list(0).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn append_segments_rejects_speaker_that_was_never_upserted() {
+        // Documents the `segments.speaker_id REFERENCES speakers(id)`
+        // failure mode (foreign_keys = ON): the recorder must upsert
+        // every speaker a chunk references before appending, otherwise
+        // the whole batch is rejected and its segments are lost.
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let id = MeetingId::new();
+        store
+            .create(CreateMeeting {
+                id,
+                title: "fk".into(),
+                input_format: fmt(),
+            })
+            .await
+            .unwrap();
+
+        let mut seg = segment(0, 1_000, "orphan");
+        seg.speaker_id = Some(SpeakerId::new());
+        let err = store
+            .append_segments(id, &[seg])
+            .await
+            .expect_err("unknown speaker id must violate the foreign key");
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "unexpected error: {err}"
+        );
+        let meeting = store.get(id).await.unwrap().expect("meeting exists");
+        assert!(meeting.segments.is_empty(), "failed batch must not persist");
+    }
+
+    /// Seed a meeting with one segment per text and return their ids.
+    async fn seed_segments(
+        store: &SqliteMeetingStore,
+        texts: &[&str],
+    ) -> (MeetingId, Vec<SegmentId>) {
+        let id = MeetingId::new();
+        store
+            .create(CreateMeeting {
+                id,
+                title: "m".into(),
+                input_format: fmt(),
+            })
+            .await
+            .unwrap();
+        let segments: Vec<Segment> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| segment(i as u32 * 1_000, (i as u32 + 1) * 1_000, t))
+            .collect();
+        let ids = segments.iter().map(|s| s.id).collect();
+        store.append_segments(id, &segments).await.unwrap();
+        (id, ids)
+    }
+
+    #[tokio::test]
+    async fn retrieval_is_scoped_to_the_requested_meeting() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (mine, my_ids) = seed_segments(&store, &["el presupuesto de Atlas"]).await;
+        let (_other, _) = seed_segments(&store, &["otro presupuesto distinto"]).await;
+
+        let hits = store
+            .search_segments(mine, "presupuesto", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.iter().map(|h| h.segment_id).collect::<Vec<_>>(),
+            my_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_matches_any_word_of_the_question() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, ids) = seed_segments(&store, &["hablamos del clima", "el viaje a Lisboa"]).await;
+
+        let hits = store
+            .search_segments(id, "¿Cuándo es el viaje de empresa a Madrid?", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segment_id, ids[1]);
+    }
+
+    #[tokio::test]
+    async fn retrieval_ignores_diacritics_in_both_directions() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, ids) = seed_segments(&store, &["La planificación empieza pronto"]).await;
+
+        for query in ["planificacion", "PLANIFICACIÓN"] {
+            let hits = store.search_segments(id, query, 10).await.unwrap();
+            assert_eq!(hits.len(), 1, "{query}");
+            assert_eq!(hits[0].segment_id, ids[0], "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieval_prefix_matches_plurals_of_longer_words() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, ids) = seed_segments(&store, &["Tomamos varias decisiones importantes"]).await;
+
+        let hits = store
+            .search_segments(id, "¿qué decisión?", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segment_id, ids[0]);
+    }
+
+    #[tokio::test]
+    async fn retrieval_with_only_stopwords_or_short_words_is_empty() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, _) = seed_segments(&store, &["el que de la una the and"]).await;
+
+        for query in [
+            "",
+            "   ",
+            "¿Qué es el de la?",
+            "the and of",
+            "a b",
+            "la reunión",
+        ] {
+            assert!(
+                store
+                    .search_segments(id, query, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{query:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieval_treats_fts_and_sql_syntax_as_plain_text() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, ids) = seed_segments(&store, &["presupuesto anual"]).await;
+
+        for query in [
+            r#"presupuesto" OR "x"#,
+            "presupuesto AND NOT (anual",
+            "presupuesto* NEAR/2 ^anual",
+            "'; DROP TABLE segments; --",
+            "col:presupuesto",
+            "\"\"\"",
+        ] {
+            let hits = store.search_segments(id, query, 10).await;
+            assert!(hits.is_ok(), "{query:?}: {hits:?}");
+        }
+        let hits = store
+            .search_segments(id, "'; DROP TABLE segments; -- presupuesto", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits[0].segment_id, ids[0]);
+    }
+
+    #[tokio::test]
+    async fn retrieval_orders_by_bm25_and_respects_the_limit() {
+        let store = SqliteMeetingStore::open_in_memory().await.unwrap();
+        let (id, ids) = seed_segments(
+            &store,
+            &[
+                "mencionamos el presupuesto una vez entre muchas otras cosas del orden del día",
+                "presupuesto presupuesto presupuesto",
+                "nada relacionado",
+            ],
+        )
+        .await;
+
+        let hits = store.search_segments(id, "presupuesto", 10).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.segment_id).collect::<Vec<_>>(),
+            vec![ids[1], ids[0]]
+        );
+        assert!(hits[0].rank <= hits[1].rank, "{hits:?}");
+
+        let capped = store.search_segments(id, "presupuesto", 1).await.unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].segment_id, ids[1]);
+    }
+
+    #[test]
+    fn retrieval_query_drops_stopwords_dedupes_and_quotes_tokens() {
+        assert_eq!(
+            build_retrieval_query("¿Cuál fue el presupuesto, el PRESUPUESTO de Atlas?"),
+            Some(r#""presupuesto"* OR "atlas"*"#.to_string())
+        );
+        assert_eq!(
+            build_retrieval_query("what is the plan"),
+            Some(r#""plan""#.into())
+        );
+        assert_eq!(build_retrieval_query("de la el"), None);
     }
 }

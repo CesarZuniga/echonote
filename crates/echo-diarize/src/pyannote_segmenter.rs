@@ -11,16 +11,24 @@
 //! | Tensor   | Shape              | Notes                         |
 //! |----------|--------------------|-------------------------------|
 //! | Input 0  | `[1, 1, N]`        | mono f32 PCM at 16 kHz        |
-//! | Output 0 | `[1, T, S]`        | per-frame speaker probabilities |
+//! | Output 0 | `[1, T, 7]`        | per-frame powerset log-probabilities |
 //!
-//! where `N` = number of input samples (pad to `CHUNK_SAMPLES`),
-//! `T` = `N / HOP_SIZE` (≈ 10 ms per frame), and `S` = number of
-//! local speaker channels (3 for pyannote-segmentation-3.0).
+//! where `N` = number of input samples (pad to `CHUNK_SAMPLES`) and `T`
+//! is the model's frame count (293 for 10 s of audio).
+//!
+//! The head is a **powerset** classifier (`LogSoftmax` over 7 classes),
+//! not 3 independent per-speaker sigmoids: max 3 speakers, max 2
+//! simultaneous. The class order is
+//! `[none, s0, s1, s2, s0+s1, s0+s2, s1+s2]`. Every value is `<= 0`, so
+//! thresholding the raw output can never fire.
 //!
 //! ## Post-processing
 //!
-//! 1. Threshold each speaker channel at `speaker_threshold`.
-//! 2. Run-length encode the binary activity signal per channel.
+//! 1. Per frame, take the `argmax` class and expand it to the set of
+//!    active local speakers ([`decode_powerset`]), giving a `[T, 3]`
+//!    boolean activity matrix.
+//! 2. Run-length encode the activity per speaker column; spans of
+//!    different speakers may overlap.
 //! 3. Convert frame indices back to sample offsets.
 //! 4. Discard segments shorter than `min_segment_samples`.
 //!
@@ -31,11 +39,13 @@
 //!
 //! ## Chunk size constraint
 //!
-//! The model was exported with a fixed input width (`CHUNK_SAMPLES`).
-//! Shorter inputs are zero-padded on the right; longer inputs are
-//! centre-cropped. Callers should feed chunks close to `CHUNK_SAMPLES`
-//! for best accuracy. The streaming pipeline typically calls this with
-//! its configured `chunk_ms` audio — 5 s chunks work well.
+//! The model was exported with a fixed input width (`CHUNK_SAMPLES`,
+//! 5 s). Shorter inputs are zero-padded on the right; longer inputs
+//! (the streaming pipeline cuts variable-length chunks at speech
+//! pauses, up to its `max_chunk_ms`) are split into consecutive 5 s
+//! windows, the last one padded, and the segments are shifted back
+//! into the caller's sample coordinates. `local_speaker` indices are
+//! window-local.
 //!
 //! ## Verification note
 //!
@@ -65,12 +75,128 @@ pub const PYANNOTE_HOP_SAMPLES: usize = 160;
 /// Maximum number of local speakers the model can detect per chunk.
 pub const PYANNOTE_MAX_LOCAL_SPEAKERS: u8 = 3;
 
+/// Number of powerset classes in the model output
+/// (`none`, 3 singles, 3 pairs).
+pub const POWERSET_CLASSES: usize = 7;
+
+/// Active local speakers for each powerset class, in the model's class
+/// order `[none, s0, s1, s2, s0+s1, s0+s2, s1+s2]`.
+const POWERSET_MAP: [[bool; 3]; POWERSET_CLASSES] = [
+    [false, false, false],
+    [true, false, false],
+    [false, true, false],
+    [false, false, true],
+    [true, true, false],
+    [true, false, true],
+    [false, true, true],
+];
+
+/// Decode flat `[T, 7]` powerset log-probabilities into a per-frame
+/// activity matrix `[T][3]`.
+///
+/// Takes the `argmax` class of each frame (monotonic in log-softmax, so
+/// no `exp` is needed) and expands it to the set of active speakers.
+/// Trailing values that do not fill a whole frame are ignored.
+pub fn decode_powerset(log_probs: &[f32]) -> Vec<[bool; 3]> {
+    let (frames, _remainder) = log_probs.as_chunks::<POWERSET_CLASSES>();
+    frames
+        .iter()
+        .map(|frame| {
+            let best = frame
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |acc, (k, &v)| {
+                    if v > acc.1 {
+                        (k, v)
+                    } else {
+                        acc
+                    }
+                })
+                .0;
+            POWERSET_MAP[best]
+        })
+        .collect()
+}
+
+/// Validate the model output shape and return the number of frames.
+///
+/// The segmenter feeds exactly one window per call, so the output must
+/// be `[1, T, 7]`. Anything else (other rank, batch, or class count)
+/// would make the flattened decode walk across batch boundaries.
+fn validate_output_shape(shape: &[usize]) -> Result<usize, DomainError> {
+    if shape.len() != 3 || shape[0] != 1 || shape[2] != POWERSET_CLASSES {
+        return Err(DomainError::DiarizationFailed(format!(
+            "unexpected pyannote output shape {shape:?} (expected [1, T, {POWERSET_CLASSES}])"
+        )));
+    }
+    Ok(shape[1])
+}
+
+/// Map output frames back to sample offsets in the caller's audio.
+///
+/// The model always sees exactly `window` samples: shorter inputs are
+/// zero-padded on the right and longer ones are centre-cropped. The `T`
+/// output frames therefore always span the full window, never just the
+/// caller's audio. Returns `(samples_per_frame, offset)`: frame `t`
+/// starts at `offset + t * samples_per_frame` in the caller's buffer,
+/// where `offset` is the centre-crop start (0 when padded).
+fn frame_geometry(input_len: usize, window: usize, num_frames: usize) -> (f32, usize) {
+    let samples_per_frame = window as f32 / num_frames as f32;
+    let offset = input_len.saturating_sub(window) / 2;
+    (samples_per_frame, offset)
+}
+
+/// Run-length encode a `[T][3]` activity matrix into per-speaker
+/// segments, sorted chronologically.
+///
+/// `samples_per_frame` and `offset` map frame indices to sample offsets
+/// in the caller's buffer (see [`frame_geometry`]); ends are clamped to
+/// `max_samples` so padded frames never extend past the real audio. Runs shorter than `min_segment_samples`
+/// are dropped.
+fn activity_to_segments(
+    activity: &[[bool; 3]],
+    samples_per_frame: f32,
+    offset: usize,
+    max_samples: usize,
+    min_segment_samples: usize,
+) -> Vec<SpeakerSegment> {
+    let mut segments = Vec::new();
+    for spk in 0..3 {
+        let mut span_start: Option<usize> = None;
+        // `t == len` is a sentinel that closes a span open at the end.
+        for t in 0..=activity.len() {
+            let active = activity.get(t).is_some_and(|f| f[spk]);
+            match (active, span_start) {
+                (true, None) => span_start = Some(t),
+                (false, Some(start)) => {
+                    let start_sample = (offset
+                        + (start as f32 * samples_per_frame).round() as usize)
+                        .min(max_samples);
+                    let end_sample =
+                        (offset + (t as f32 * samples_per_frame).round() as usize).min(max_samples);
+                    // Runs that fall entirely in the zero-padded tail clamp
+                    // to an empty range; never emit those, whatever the minimum.
+                    if end_sample > start_sample && end_sample - start_sample >= min_segment_samples
+                    {
+                        segments.push(SpeakerSegment {
+                            start_sample,
+                            end_sample,
+                            local_speaker: spk as u8,
+                        });
+                    }
+                    span_start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    segments.sort_by_key(|s| (s.start_sample, s.local_speaker));
+    segments
+}
+
 /// Tunable knobs for [`PyannoteSegmenter`].
 #[derive(Debug, Clone, Copy)]
 pub struct PyannoteSegmenterConfig {
-    /// Probability above which a frame is considered active for a
-    /// given local speaker.
-    pub speaker_threshold: f32,
     /// Minimum segment length in samples. Segments shorter than this
     /// are discarded (they are likely noise at a speaker boundary).
     pub min_segment_samples: usize,
@@ -79,7 +205,6 @@ pub struct PyannoteSegmenterConfig {
 impl Default for PyannoteSegmenterConfig {
     fn default() -> Self {
         Self {
-            speaker_threshold: 0.5,
             // 0.5 s minimum — shorter segments produce unreliable
             // embeddings from the downstream ERes2Net / CAM++ adapter.
             min_segment_samples: PYANNOTE_SAMPLE_RATE as usize / 2,
@@ -178,16 +303,23 @@ impl Segmenter for PyannoteSegmenter {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
+        // Variable-length chunks (speech-aligned streaming) are split
+        // into consecutive model windows instead of centre-cropped, so
+        // no audio goes unsegmented.
+        segment_in_windows(samples, PYANNOTE_CHUNK_SAMPLES, |window| {
+            self.segment_window(window)
+        })
+    }
+}
 
-        // Pad or centre-crop to PYANNOTE_CHUNK_SAMPLES.
+impl PyannoteSegmenter {
+    /// Segment at most one model window; shorter input is zero-padded
+    /// on the right.
+    fn segment_window(&mut self, samples: &[Sample]) -> Result<Vec<SpeakerSegment>, DomainError> {
         let n = PYANNOTE_CHUNK_SAMPLES;
         let mut padded = vec![0.0_f32; n];
-        if samples.len() >= n {
-            let start = (samples.len() - n) / 2;
-            padded.copy_from_slice(&samples[start..start + n]);
-        } else {
-            padded[..samples.len()].copy_from_slice(samples);
-        }
+        let len = samples.len().min(n);
+        padded[..len].copy_from_slice(&samples[..len]);
 
         // Build input tensor: [1, 1, N].
         let input = Tensor::from_shape(&[1_usize, 1, n], &padded)
@@ -198,68 +330,47 @@ impl Segmenter for PyannoteSegmenter {
             .run(tvec!(input.into_tvalue()))
             .map_err(|e| DomainError::DiarizationFailed(format!("inference: {e}")))?;
 
-        // Output is [1, T, S] — extract the [T, S] view.
+        // Output is [1, T, 7] powerset log-probabilities.
         let view = outputs[0]
             .to_array_view::<f32>()
             .map_err(|e| DomainError::DiarizationFailed(format!("output dtype: {e}")))?;
 
-        let shape = view.shape();
-        if shape.len() < 3 {
-            return Err(DomainError::DiarizationFailed(format!(
-                "unexpected pyannote output rank: {} (expected 3)",
-                shape.len()
-            )));
-        }
-        let num_frames = shape[1];
-        let num_spk = shape[2];
+        let num_frames = validate_output_shape(view.shape())?;
+        let flat: Vec<f32> = view.iter().copied().collect();
+        let activity = decode_powerset(&flat);
+        let (samples_per_frame, offset) = frame_geometry(len, n, num_frames);
 
-        // How many samples in the original (pre-pad/crop) audio does
-        // each frame represent?
-        let input_len = samples.len().min(n);
-        let samples_per_frame = input_len as f32 / num_frames as f32;
-
-        let mut segments: Vec<SpeakerSegment> = Vec::new();
-
-        for spk in 0..num_spk {
-            // Walk frames to collect active spans for this speaker.
-            let mut span_start: Option<usize> = None;
-
-            for t in 0..=num_frames {
-                let active = if t < num_frames {
-                    view[[0, t, spk]] >= self.config.speaker_threshold
-                } else {
-                    false // sentinel to close an open span at the end
-                };
-
-                match (active, span_start) {
-                    (true, None) => {
-                        span_start = Some(t);
-                    }
-                    (false, Some(start)) => {
-                        let start_sample = (start as f32 * samples_per_frame).round() as usize;
-                        let end_sample =
-                            ((t as f32 * samples_per_frame).round() as usize).min(samples.len());
-
-                        if end_sample.saturating_sub(start_sample)
-                            >= self.config.min_segment_samples
-                        {
-                            segments.push(SpeakerSegment {
-                                start_sample,
-                                end_sample,
-                                local_speaker: spk as u8,
-                            });
-                        }
-                        span_start = None;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Sort by start sample for a clean chronological order.
-        segments.sort_by_key(|s| (s.start_sample, s.local_speaker));
-        Ok(segments)
+        Ok(activity_to_segments(
+            &activity,
+            samples_per_frame,
+            offset,
+            len,
+            self.config.min_segment_samples,
+        ))
     }
+}
+
+/// Run `infer` over consecutive `window`-sample slices of `samples`
+/// (the last one may be shorter) and shift each slice's segments into
+/// `samples` coordinates, sorted chronologically. `local_speaker`
+/// indices stay window-local: the same voice may get different indices
+/// in different windows, and a turn crossing a window edge is split.
+fn segment_in_windows(
+    samples: &[Sample],
+    window: usize,
+    mut infer: impl FnMut(&[Sample]) -> Result<Vec<SpeakerSegment>, DomainError>,
+) -> Result<Vec<SpeakerSegment>, DomainError> {
+    let mut segments = Vec::new();
+    for (k, slice) in samples.chunks(window).enumerate() {
+        let base = k * window;
+        segments.extend(infer(slice)?.into_iter().map(|s| SpeakerSegment {
+            start_sample: s.start_sample + base,
+            end_sample: s.end_sample + base,
+            ..s
+        }));
+    }
+    segments.sort_by_key(|s| (s.start_sample, s.local_speaker));
+    Ok(segments)
 }
 
 #[cfg(test)]
@@ -267,6 +378,94 @@ mod tests {
     use super::*;
     use echo_domain::Segmenter;
     use std::path::PathBuf;
+
+    #[test]
+    fn output_shape_must_be_single_batch_powerset() {
+        assert_eq!(validate_output_shape(&[1, 293, 7]).unwrap(), 293);
+        assert!(
+            validate_output_shape(&[2, 293, 7]).is_err(),
+            "batch > 1 must be rejected"
+        );
+        assert!(
+            validate_output_shape(&[1, 293, 3]).is_err(),
+            "non-powerset head must be rejected"
+        );
+        assert!(
+            validate_output_shape(&[293, 7]).is_err(),
+            "rank 2 must be rejected"
+        );
+    }
+
+    #[test]
+    fn short_input_frames_cover_the_padded_window() {
+        // 2 s of audio zero-padded to a 5 s window: the T frames span the
+        // whole window, so each frame is window / T samples long.
+        let (spf, offset) = frame_geometry(32_000, 80_000, 293);
+        assert!((spf - 80_000.0 / 293.0).abs() < 1e-3, "got {spf}");
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn long_input_frames_are_offset_by_the_centre_crop() {
+        // 80_600 samples centre-cropped to 80_000: frame 0 starts 300
+        // samples into the caller's buffer.
+        let (spf, offset) = frame_geometry(80_600, 80_000, 293);
+        assert!((spf - 80_000.0 / 293.0).abs() < 1e-3, "got {spf}");
+        assert_eq!(offset, 300);
+    }
+
+    #[test]
+    fn runs_entirely_in_the_padded_tail_are_dropped() {
+        // 10 frames of 100 samples, but only 300 real samples: frames
+        // 5..10 lie in the zero-padded tail. Even with no minimum length,
+        // a run that clamps to an empty range must not become a segment.
+        let mut activity = vec![[false; 3]; 10];
+        for f in activity.iter_mut().skip(5) {
+            f[0] = true;
+        }
+        let segs = activity_to_segments(&activity, 100.0, 0, 300, 0);
+        assert!(segs.is_empty(), "zero-length segments emitted: {segs:?}");
+    }
+
+    #[test]
+    fn segments_are_shifted_by_offset_and_clamped_to_input() {
+        let activity = vec![[true, false, false]; 10];
+        let segs = activity_to_segments(&activity, 100.0, 300, 1_050, 0);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].start_sample, 300);
+        assert_eq!(
+            segs[0].end_sample, 1_050,
+            "end must be clamped to input length"
+        );
+    }
+
+    #[test]
+    fn long_inputs_are_segmented_window_by_window_in_input_coordinates() {
+        let mut seen = Vec::new();
+        let segs = segment_in_windows(&[0.0; 250], 100, |w| {
+            seen.push(w.len());
+            Ok(vec![SpeakerSegment {
+                start_sample: 10,
+                end_sample: 20,
+                local_speaker: 0,
+            }])
+        })
+        .unwrap();
+        assert_eq!(seen, vec![100, 100, 50], "last window is the remainder");
+        let ranges: Vec<(usize, usize)> = segs
+            .iter()
+            .map(|s| (s.start_sample, s.end_sample))
+            .collect();
+        assert_eq!(ranges, vec![(10, 20), (110, 120), (210, 220)]);
+    }
+
+    #[test]
+    fn window_errors_abort_the_whole_input() {
+        let result = segment_in_windows(&[0.0; 250], 100, |_| {
+            Err(DomainError::DiarizationFailed("boom".into()))
+        });
+        assert!(result.is_err());
+    }
 
     fn model_path() -> PathBuf {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -360,5 +559,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Build a `[T, 7]` log-softmax-like tensor where each frame puts
+    /// its mass on one class (all values are negative, like the model).
+    fn frames_of(classes: &[usize]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(classes.len() * POWERSET_CLASSES);
+        for &c in classes {
+            for k in 0..POWERSET_CLASSES {
+                out.push(if k == c { -0.01 } else { -6.0 });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decode_powerset_maps_silence_single_and_overlap_classes() {
+        let tensor = frames_of(&[0, 2, 4, 6, 3]);
+        let act = decode_powerset(&tensor);
+        assert_eq!(act[0], [false, false, false], "class 0 is silence");
+        assert_eq!(act[1], [false, true, false], "class 2 is speaker1 only");
+        assert_eq!(act[2], [true, true, false], "class 4 is speaker0+speaker1");
+        assert_eq!(act[3], [false, true, true], "class 6 is speaker1+speaker2");
+        assert_eq!(act[4], [false, false, true], "class 3 is speaker2 only");
+    }
+
+    #[test]
+    fn spans_split_on_gaps_and_drop_short_runs() {
+        // speaker0: frames 0..4 and 6..8 (second run too short);
+        // 1 sample per frame, min length 3.
+        let mut act = vec![[false; 3]; 10];
+        for t in [0, 1, 2, 3, 6, 7] {
+            act[t][0] = true;
+        }
+        // speaker1 overlaps speaker0 on frames 2..5.
+        for frame in &mut act[2..5] {
+            frame[1] = true;
+        }
+        let segs = activity_to_segments(&act, 1.0, 0, 10, 3);
+        assert_eq!(
+            segs,
+            vec![
+                SpeakerSegment {
+                    start_sample: 0,
+                    end_sample: 4,
+                    local_speaker: 0
+                },
+                SpeakerSegment {
+                    start_sample: 2,
+                    end_sample: 5,
+                    local_speaker: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn spans_close_when_activity_runs_to_the_last_frame() {
+        let act = vec![[true, false, false]; 5];
+        let segs = activity_to_segments(&act, 2.0, 0, 10, 4);
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].start_sample, segs[0].end_sample), (0, 10));
     }
 }

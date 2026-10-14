@@ -19,14 +19,21 @@ export type AudioFormat = {
 /**
  * Where the backend should pull audio from.
  *
- * - `microphone`: default cpal input. Requires Microphone permission
- *   on macOS the first time it runs.
- * - `systemOutput`: the system audio mix (the "other side of the
- *   call"). macOS 13+ only — uses ScreenCaptureKit and requires
- *   Screen Recording permission. The backend ignores `deviceId` for
- *   this source.
+ * - `microphone`: default cpal input. Requires Microphone permission.
+ * - `systemOutput`: system audio loopback (macOS 13+, ScreenCaptureKit).
+ *   The backend ignores `deviceId` for this source.
+ * - `mixed`: microphone + system audio merged. Best with headphones:
+ *   mic captures the local speaker, system captures remote participants.
+ *   Use `setMixSources` to mute/unmute each channel during a session.
  */
-export type AudioSourceKind = "microphone" | "systemOutput";
+export type AudioSourceKind = "microphone" | "systemOutput" | "mixed";
+
+/** Information about the system's current default audio output device. */
+export type OutputDeviceInfo = {
+  name: string;
+  /** True when the device name suggests headphones / earbuds. */
+  isHeadphones: boolean;
+};
 
 export type StartStreamingOptions = {
   source?: AudioSourceKind;
@@ -76,6 +83,12 @@ export type TranscriptEvent =
        * `undefined`.
        */
       speakerSlot?: number;
+      /**
+       * Every distinct speaker referenced by `segments` (a segment may
+       * belong to a different speaker than the chunk-dominant one).
+       * Omitted by older backends; treat `undefined` as empty.
+       */
+      speakers?: SpeakerRef[];
     }
   | {
       type: "skipped";
@@ -103,4 +116,69 @@ export type TranscriptEvent =
   | {
       type: "resumed";
       sessionId: StreamingSessionId;
+    }
+  | {
+      /**
+       * Offline diarization refinement applied at end-of-session.
+       * Carries `(absorbed, surviving)` SpeakerId pairs; the recorder
+       * has already rewritten persisted segments and dropped absorbed
+       * speaker rows by the time the frontend sees this. UI listeners
+       * may use it to refresh any in-memory speakers list they kept.
+       */
+      type: "speakersMerged";
+      sessionId: StreamingSessionId;
+      merges: SpeakerMerge[];
+    }
+  | {
+      /**
+       * Offline re-segmentation applied at end-of-session (ADR 0001).
+       * Ids, slots and indices only; every field is a set-to-value, so
+       * applying it twice is harmless. The recorder has already
+       * persisted it when the frontend sees it. Emitted after the last
+       * `chunk` and before `stopped`, only when a segment moved.
+       */
+      type: "speakersReassigned";
+      sessionId: StreamingSessionId;
+      /** UUIDv7 of the plan; lets the UI detect a replay. */
+      planId: string;
+      created: SpeakerRef[];
+      retired: SpeakerRetirement[];
+      segments: SegmentSpeaker[];
+      chunks: ChunkSpeaker[];
     };
+
+/** A speaker the refine left without segments, and who took its speech. */
+export type SpeakerRetirement = {
+  speaker: SpeakerId;
+  majorityRecipient: SpeakerId | null;
+};
+
+/** New speaker of one already-emitted segment. */
+export type SegmentSpeaker = {
+  segmentId: string;
+  speakerId: SpeakerId | null;
+};
+
+/** New dominant speaker of one already-emitted chunk (live pane). */
+export type ChunkSpeaker = {
+  chunkIndex: number;
+  speakerId: SpeakerId | null;
+  speakerSlot: number | null;
+};
+
+/** A speaker referenced by a chunk: stable id plus arrival-order slot. */
+export type SpeakerRef = {
+  id: SpeakerId;
+  slot: number;
+};
+
+/**
+ * One offline-refinement merge: `absorbed` is collapsed into
+ * `surviving`. Persisted segments referring to `absorbed` are
+ * rewritten to point at `surviving`; the `absorbed` speaker row is
+ * dropped from the meeting.
+ */
+export type SpeakerMerge = {
+  absorbed: SpeakerId;
+  surviving: SpeakerId;
+};

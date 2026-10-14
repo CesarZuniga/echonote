@@ -11,6 +11,17 @@
 //!   speaker.
 //! - [`online_diarizer`]: [`OnlineDiarizer`], the [`echo_domain::Diarizer`]
 //!   adapter that wires an embedder to a cluster.
+//! - [`metrics`]: RTTM parsing and diarization error rate (DER) scoring
+//!   for offline benchmarks.
+//! - [`embedding_log`]: the in-RAM, timestamped embedding log behind
+//!   the end-of-session refine (never persisted or logged).
+//! - [`resegment`]: re-segmentation of that log into a span relabel
+//!   plan with stable speaker ids (ADR 0001).
+//! - [`vbx`] and [`plda`]: the VB-HMM clustering behind the
+//!   re-segmentation (a port of BUTSpeechFIT VBx, Apache-2.0) and its PLDA
+//!   back-end.
+//! - [`presets`]: [`EmbedderFamily`], the per-embedder loader and
+//!   clustering thresholds the app and the benchmarks share.
 //!
 //! Two ONNX speaker embedder adapters are provided:
 //!
@@ -23,10 +34,16 @@
 pub mod cam_plus_plus;
 pub mod cluster;
 pub mod embedding;
+pub mod embedding_log;
 pub mod eres2net;
+pub mod metrics;
 pub mod offline_refine;
 pub mod online_diarizer;
+pub mod plda;
+pub mod presets;
 pub mod pyannote_segmenter;
+pub mod resegment;
+pub mod vbx;
 
 pub use cam_plus_plus::{
     CamPlusPlusConfig, CamPlusPlusEmbedder, CAMPP_EMBED_DIM, CAMPP_FBANK_DIM, CAMPP_MIN_SAMPLES,
@@ -34,13 +51,20 @@ pub use cam_plus_plus::{
 };
 pub use cluster::{OnlineCluster, OnlineClusterConfig};
 pub use embedding::{cosine_similarity, l2_normalize, SpeakerEmbedder};
+pub use embedding_log::EMBEDDING_LOG_CAP;
 pub use eres2net::{
     Eres2NetConfig, Eres2NetEmbedder, ERES2NET_EMBED_DIM, ERES2NET_FBANK_DIM, ERES2NET_MIN_SAMPLES,
     ERES2NET_SAMPLE_RATE, ERES2NET_TARGET_FRAMES,
 };
+pub use metrics::{
+    parse_rttm, score_der, write_rttm, DerConfig, DerReport, RttmError, RttmSegment,
+};
 pub use offline_refine::{refine_speakers, OfflineRefineConfig};
 pub use online_diarizer::OnlineDiarizer;
+pub use plda::Plda;
+pub use presets::{EmbedderFamily, OfflineRefineMode};
 pub use pyannote_segmenter::{
     PyannoteSegmenter, PyannoteSegmenterConfig, PYANNOTE_CHUNK_SAMPLES, PYANNOTE_HOP_SAMPLES,
     PYANNOTE_MAX_LOCAL_SPEAKERS, PYANNOTE_SAMPLE_RATE,
 };
+pub use vbx::{VbxConfig, VbxInit, VbxParams};

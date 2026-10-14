@@ -39,11 +39,11 @@ use echo_app::{MeetingRecorder, RenameSpeaker, StreamingHandle};
 use echo_asr::WhisperCppTranscriber;
 use echo_audio::{RoutingAudioCapture, RubatoResamplerAdapter, SileroVad};
 use echo_diarize::{
-    embedding::SpeakerEmbedder, CamPlusPlusEmbedder, Eres2NetEmbedder, OnlineDiarizer,
+    EmbedderFamily, OfflineRefineConfig, OfflineRefineMode, OnlineClusterConfig, OnlineDiarizer,
     PyannoteSegmenter,
 };
 use echo_domain::{
-    AudioCapture, ChatAssistant, Diarizer, LlmModel, MeetingStore, Resampler, Transcriber,
+    ChatAssistant, Diarizer, LlmModel, MeetingStore, Resampler, SegmentRetriever, Transcriber,
 };
 use echo_llm::{LlamaCppLlm, LoadOptions as LlamaLoadOptions};
 use echo_storage::SqliteMeetingStore;
@@ -136,7 +136,7 @@ pub fn health_check() -> HealthStatus {
 /// SQLite-backed meeting store, the per-session meeting recorder and
 /// the in-flight streaming sessions so they can be stopped from the UI.
 pub struct AppState {
-    pub(crate) capture: Arc<dyn AudioCapture>,
+    pub(crate) capture: Arc<RoutingAudioCapture>,
     pub(crate) resampler: Arc<dyn Resampler>,
     /// Shared HTTP client with connect timeout. Reused across all model
     /// downloads to amortise TLS handshake and connection-pool overhead.
@@ -153,7 +153,13 @@ pub struct AppState {
     /// When the file exists, `build_diarizer` attaches a
     /// `PyannoteSegmenter` to the `OnlineDiarizer` automatically.
     pub(crate) seg_model_path: PathBuf,
+    /// `true` when `seg_model_path` came from `ECHO_SEG_MODEL`; such a
+    /// path is never swapped for the tract file at session start.
+    pub(crate) seg_model_explicit: bool,
     pub(crate) store: Arc<dyn MeetingStore>,
+    /// Per-meeting segment search the chat uses on transcripts that do not
+    /// fit the context window; backed by the same database as `store`.
+    pub(crate) retriever: Arc<dyn SegmentRetriever>,
     pub(crate) recorder: Arc<MeetingRecorder>,
     pub(crate) rename_speaker: Arc<RenameSpeaker>,
     /// In-flight streaming sessions.
@@ -193,6 +199,11 @@ pub(crate) struct SessionEntry {
     /// RAII guard — prevents the OS from sleeping while recording.
     /// Dropped automatically when the session entry is removed.
     pub _keep_awake: Option<keepawake::KeepAwake>,
+    /// Mix source controls — `Some` only when the session was started
+    /// with `AudioSource::Mixed`. The `set_mix_sources` command
+    /// writes to these flags to toggle each source during a live session.
+    pub mic_active: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub sys_active: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl AppState {
@@ -310,10 +321,12 @@ impl AppState {
             env_override("ECHO_EMBED_MODEL"),
             preferred_embed_model(&data_root),
         );
+        let seg_override = env_override("ECHO_SEG_MODEL").filter(|s| !s.trim().is_empty());
+        let seg_model_explicit = seg_override.is_some();
         let seg_model_path = resolve_asset_path(
             &data_root,
-            env_override("ECHO_SEG_MODEL"),
-            "models/segmenter/pyannote_segmentation_3.onnx",
+            seg_override,
+            preferred_segmenter_model(&data_root),
         );
         let llm_model_path = resolve_asset_path(
             &data_root,
@@ -341,6 +354,7 @@ impl AppState {
         })?;
         tracing::info!(db_path = %db_path.display(), "meeting store ready");
 
+        let retriever: Arc<dyn SegmentRetriever> = Arc::new(store.clone());
         let store: Arc<dyn MeetingStore> = Arc::new(store);
         let recorder = Arc::new(MeetingRecorder::with_default_title(store.clone()));
         let rename_speaker = Arc::new(RenameSpeaker::new(store.clone()));
@@ -353,7 +367,9 @@ impl AppState {
             model_path: std::sync::RwLock::new(model_path),
             embed_model_path: std::sync::RwLock::new(embed_model_path),
             seg_model_path,
+            seg_model_explicit,
             store,
+            retriever,
             recorder,
             rename_speaker,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -428,10 +444,10 @@ impl AppState {
 
     /// Build a fresh diarizer for the upcoming session.
     ///
-    /// Embedder selection: if the resolved path filename contains
-    /// "camplusplus" or "campplus", `CamPlusPlusEmbedder` is loaded;
-    /// otherwise `Eres2NetEmbedder` is used. The pyannote segmenter is
-    /// attached automatically when its model file is present on disk.
+    /// The embedder family, its adapter and its clustering thresholds
+    /// follow the model's catalog id through [`EmbedderFamily`] (see
+    /// [`embedder_family`] and [`diarizer_preset`]). The pyannote segmenter is attached
+    /// automatically when its model file is present on disk.
     pub(crate) fn build_diarizer(
         &self,
         override_path: Option<PathBuf>,
@@ -444,67 +460,70 @@ impl AppState {
             ));
         }
 
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let started = std::time::Instant::now();
-        let embedder: Box<dyn SpeakerEmbedder> =
-            if file_name.contains("camplusplus") || file_name.contains("campplus") {
-                let emb = CamPlusPlusEmbedder::new(&path).map_err(|e| {
-                    IpcError::new(
-                        ErrorCode::Diarization,
-                        format!("load CAM++ at {}: {e}", path.display()),
-                    )
-                })?;
-                tracing::info!(
-                    model = %path.display(),
-                    load_ms = started.elapsed().as_millis() as u64,
-                    "CAM++ speaker embedder ready"
-                );
-                Box::new(emb)
-            } else {
-                let emb = Eres2NetEmbedder::new(&path).map_err(|e| {
-                    IpcError::new(
-                        ErrorCode::Diarization,
-                        format!("load ERes2Net at {}: {e}", path.display()),
-                    )
-                })?;
-                tracing::info!(
-                    model = %path.display(),
-                    load_ms = started.elapsed().as_millis() as u64,
-                    "ERes2Net speaker embedder ready"
-                );
-                Box::new(emb)
-            };
-
-        // CAM++ 512-dim embeddings have a higher cross-speaker baseline
-        // than ERes2Net 192-dim. In controlled English fixtures
-        // cross-speaker cosine is ~0.57, but real-world Spanish podcasts
-        // (same mic, same gender, similar timbre) can push cross-speaker
-        // to 0.70–0.78. We set:
-        //   - similarity_threshold = 0.78: high enough to separate same-
-        //     gender speakers sharing a mic, low enough that the same
-        //     speaker's centroids don't over-split.
-        //   - merge_threshold = 1.0: DISABLE online centroid merging.
-        //     The EMA centroids drift toward each other over time, and at
-        //     0.85 they cascade-merge all speakers into one. The offline
-        //     AHC pass (refine_offline) handles merging properly after the
-        //     session ends, using full-session means instead of noisy EMAs.
-        let cluster_cfg = if file_name.contains("camplusplus") || file_name.contains("campplus") {
-            echo_diarize::OnlineClusterConfig {
-                similarity_threshold: 0.78,
-                merge_threshold: 1.0, // disable online merge for CAM++
-                ..Default::default()
-            }
+        // Thresholds come from the shared per-embedder presets
+        // (`echo_diarize::presets`), calibrated with `echo-proto bench
+        // der`. Dev builds can override the online similarity threshold
+        // with ECHO_DIAR_SIM_THRESHOLD.
+        let env_sim_threshold = if cfg!(debug_assertions) {
+            std::env::var("ECHO_DIAR_SIM_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
         } else {
-            echo_diarize::OnlineClusterConfig::default()
+            None
         };
-        let mut diarizer = OnlineDiarizer::new(embedder, cluster_cfg);
+        // ECHO_DIAR_REFINE=off|merge|reseg picks the end-of-session pass
+        // (debug builds only; release builds use the preset).
+        let env_refine_mode = if cfg!(debug_assertions) {
+            std::env::var("ECHO_DIAR_REFINE")
+                .ok()
+                .and_then(|v| OfflineRefineMode::parse(&v))
+        } else {
+            None
+        };
+        let (family, cluster_cfg, refine_cfg, refine_mode) =
+            diarizer_preset(&path, env_sim_threshold, env_refine_mode);
+        let started = std::time::Instant::now();
+        let embedder = family.load(&path).map_err(|e| {
+            IpcError::new(
+                ErrorCode::Diarization,
+                format!("load {family:?} embedder at {}: {e}", path.display()),
+            )
+        })?;
+        tracing::info!(
+            model = %path.display(),
+            family = ?family,
+            similarity_threshold = cluster_cfg.similarity_threshold,
+            max_speakers = cluster_cfg.max_speakers,
+            refine_threshold = refine_cfg.merge_threshold,
+            refine_mode = ?refine_mode,
+            plda = family.plda().is_some(),
+            load_ms = started.elapsed().as_millis() as u64,
+            "speaker embedder ready"
+        );
+        // Embedding accumulation lets the streaming pipeline run the
+        // offline refinement at end-of-session and emit SpeakersMerged
+        // (merge-only) or SpeakersReassigned (re-segmentation).
+        // Re-segmentation (VBx) also needs the family's PLDA model; without
+        // one it falls back to the merge-only refine.
+        let mut diarizer = OnlineDiarizer::new(embedder, cluster_cfg)
+            .with_offline_refinement_config(refine_cfg)
+            .with_vbx_config(family.vbx_config())
+            .with_refine_mode(refine_mode);
+        if let Some(plda) = family.plda() {
+            diarizer = diarizer.with_plda(plda);
+        }
 
         // Attach pyannote segmenter if the model file is installed.
-        if self.seg_model_path.exists() {
-            match PyannoteSegmenter::new(&self.seg_model_path) {
+        let seg_path = session_segmenter_path(
+            &self.data_root,
+            &self.seg_model_path,
+            self.seg_model_explicit,
+        );
+        if seg_path.exists() {
+            match PyannoteSegmenter::new(&seg_path) {
                 Ok(seg) => {
                     tracing::info!(
-                        model = %self.seg_model_path.display(),
+                        model = %seg_path.display(),
                         "pyannote segmenter attached — sub-chunk speaker boundaries enabled"
                     );
                     diarizer = diarizer.with_segmenter(Box::new(seg));
@@ -512,7 +531,7 @@ impl AppState {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        model = %self.seg_model_path.display(),
+                        model = %seg_path.display(),
                         "failed to load pyannote segmenter; continuing without sub-chunk segmentation"
                     );
                 }
@@ -535,8 +554,16 @@ impl AppState {
             );
             return Ok(None);
         }
+        let current = models::is_current_silero_vad(&self.vad_model_path);
+        if !current {
+            tracing::warn!(
+                vad_model = %self.vad_model_path.display(),
+                "Silero VAD file is not the v6.2 build this version expects; \
+                 using it anyway. Download the update from the Models panel."
+            );
+        }
         let vad_path = self.vad_model_path.clone();
-        let arc = self
+        let loaded = self
             .vad
             .get_or_init(|| async move {
                 let started = std::time::Instant::now();
@@ -557,8 +584,8 @@ impl AppState {
                 );
                 Ok::<SileroVad, IpcError>(loaded)
             })
-            .await?;
-        Ok(Some(arc))
+            .await;
+        vad_load_outcome(current, loaded, &self.vad_model_path)
     }
 
     /// Lazily load the whisper transcriber.
@@ -645,6 +672,11 @@ fn preferred_llm_model(root: &Path) -> &'static str {
         "models/llm/Qwen3-4B-Q4_K_M.gguf",
         "models/llm/qwen2.5-7b-instruct-q4_k_m.gguf",
         "models/llm/qwen2.5-3b-instruct-q4_k_m.gguf",
+        // Gemma 4 comes last on purpose: it is only ever used when the user
+        // selected it (a persisted preference) or nothing else is installed,
+        // so installing it never changes the Qwen default.
+        "models/llm/gemma-4-12B-it-qat-q4_0.gguf",
+        "models/llm/gemma-4-E4B-it-qat-q4_0.gguf",
     ];
     // Honour persisted preference if present and still downloaded.
     if let Some(pref_path) = load_preference(root, "llm") {
@@ -662,12 +694,60 @@ fn preferred_llm_model(root: &Path) -> &'static str {
     "models/llm/Qwen3-14B-Q4_K_M.gguf"
 }
 
+/// Embedder family of the model at `path`, dispatched by its catalog id.
+///
+/// Catalog models are recognised by their exact destination file name
+/// ([`path_to_catalog_id`]) and load the family that id names, so the
+/// adapter and preset follow the model identity, not a substring of its
+/// name. The file-name heuristic remains only for files outside the
+/// catalog: `ECHO_EMBED_MODEL` and the per-session override path accept
+/// any user-supplied ONNX, and refusing those would break existing dev
+/// setups; such loads are logged so a wrong guess is visible.
+fn embedder_family(path: &Path) -> EmbedderFamily {
+    if let Some(family) = path_to_catalog_id(path).and_then(|id| EmbedderFamily::from_model_id(&id))
+    {
+        return family;
+    }
+    let family = EmbedderFamily::from_path(path);
+    tracing::warn!(
+        model = %path.display(),
+        family = ?family,
+        "embedder is not a catalog model; family guessed from its file name"
+    );
+    family
+}
+
+/// Diarizer configuration for the embedder at `path`: the shared
+/// [`EmbedderFamily`] preset, with `similarity_override` (the dev-only
+/// `ECHO_DIAR_SIM_THRESHOLD`) replacing the online similarity threshold
+/// and `refine_override` (the dev-only `ECHO_DIAR_REFINE`) replacing the
+/// end-of-session refine mode.
+fn diarizer_preset(
+    path: &Path,
+    similarity_override: Option<f32>,
+    refine_override: Option<OfflineRefineMode>,
+) -> (
+    EmbedderFamily,
+    OnlineClusterConfig,
+    OfflineRefineConfig,
+    OfflineRefineMode,
+) {
+    let family = embedder_family(path);
+    (
+        family,
+        family.cluster_config(similarity_override),
+        family.refine_config(),
+        refine_override.unwrap_or_else(|| family.refine_mode()),
+    )
+}
+
 fn preferred_embed_model(root: &Path) -> &'static str {
     // If the user persisted a preference, honour it.
     if let Some(pref_path) = load_preference(root, "embedder") {
         // The preference stores the relative path directly.
         // Match against known static paths to return &'static str.
         const KNOWN: &[&str] = &[
+            "models/embedder/campplus_zh_en_common_advanced.onnx",
             "models/embedder/campplus_en_voxceleb.onnx",
             "models/embedder/eres2net_en_voxceleb.onnx",
         ];
@@ -677,9 +757,11 @@ fn preferred_embed_model(root: &Path) -> &'static str {
             }
         }
     }
-    // CAM++ has lower EER and better multilingual coverage than ERes2Net,
-    // so prefer it when already installed.
+    // Without a preference: the multilingual CAM++ first (lowest DER on
+    // Spanish and on English in the T6/T6b DER benchmark), then the EN
+    // CAM++ (lower EER than ERes2Net), then ERes2Net.
     const CANDIDATES: &[&str] = &[
+        "models/embedder/campplus_zh_en_common_advanced.onnx",
         "models/embedder/campplus_en_voxceleb.onnx",
         "models/embedder/eres2net_en_voxceleb.onnx",
     ];
@@ -689,6 +771,68 @@ fn preferred_embed_model(root: &Path) -> &'static str {
         }
     }
     "models/embedder/eres2net_en_voxceleb.onnx"
+}
+
+/// Tract-compatible (InstanceNorm-decomposed) pyannote segmenter: what the
+/// catalog downloads and `scripts/download-models.sh` produces.
+const SEGMENTER_TRACT: &str = "models/segmenter/pyannote_segmentation_3_tract.onnx";
+/// Upstream sherpa export. It does NOT load in tract 0.22
+/// (`InstanceNormalization` fails `into_optimized()`), so with only this
+/// file installed `build_diarizer` logs a warning and runs the
+/// whole-chunk path. See `scripts/patch-pyannote-segmenter.py`.
+const SEGMENTER_UPSTREAM: &str = "models/segmenter/pyannote_segmentation_3.onnx";
+
+/// Prefer the tract-compatible pyannote segmenter, fall back to the
+/// upstream export when it is the only file installed, and otherwise
+/// expect the tract file at the catalog destination so a download made
+/// after startup is used by the next session.
+fn preferred_segmenter_model(root: &Path) -> &'static str {
+    if !root.join(SEGMENTER_TRACT).exists() && root.join(SEGMENTER_UPSTREAM).exists() {
+        SEGMENTER_UPSTREAM
+    } else {
+        SEGMENTER_TRACT
+    }
+}
+
+/// Segmenter path for a new session. The startup path is kept, except
+/// when it is the default upstream export and the tract file has been
+/// installed since (e.g. downloaded from the Models panel): then the
+/// tract file wins. An `explicit` path (from `ECHO_SEG_MODEL`) is never
+/// replaced, even when it names the default upstream file.
+fn session_segmenter_path(root: &Path, configured: &Path, explicit: bool) -> PathBuf {
+    let tract = root.join(SEGMENTER_TRACT);
+    if !explicit && configured == root.join(SEGMENTER_UPSTREAM) && tract.exists() {
+        tract
+    } else {
+        configured.to_path_buf()
+    }
+}
+
+/// Decide what a VAD load result means for the session.
+///
+/// `current` says whether the file is the pinned Silero v6.2 build
+/// ([`models::is_current_silero_vad`]). An outdated file that fails to
+/// load (e.g. an old export with a baked 512-sample input) must not block
+/// recording: it degrades to the RMS gate with a warning. A failing
+/// current build stays an error.
+fn vad_load_outcome<T>(
+    current: bool,
+    loaded: Result<T, IpcError>,
+    path: &Path,
+) -> Result<Option<T>, IpcError> {
+    match loaded {
+        Ok(model) => Ok(Some(model)),
+        Err(e) if !current => {
+            tracing::warn!(
+                vad_model = %path.display(),
+                error = %e.message,
+                "outdated Silero VAD failed to load; falling back to RMS gate. \
+                 Download the update from the Models panel."
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn preferred_asr_model(root: &Path) -> &'static str {
@@ -760,10 +904,15 @@ pub(crate) fn path_to_catalog_id(path: &Path) -> Option<String> {
         "Qwen3-14B-Q4_K_M.gguf" => "llm-qwen3-14b",
         "Qwen3-8B-Q4_K_M.gguf" => "llm-qwen3-8b",
         "Qwen3-4B-Q4_K_M.gguf" => "llm-qwen3-4b",
+        "gemma-4-E4B-it-qat-q4_0.gguf" => "llm-gemma4-e4b",
+        "gemma-4-12B-it-qat-q4_0.gguf" => "llm-gemma4-12b",
         "silero_vad.onnx" => "vad-silero",
         "eres2net_en_voxceleb.onnx" => "embedder-eres2net",
         "campplus_en_voxceleb.onnx" => "embedder-camplusplus",
-        "pyannote_segmentation_3.onnx" => "segmenter-pyannote",
+        "campplus_zh_en_common_advanced.onnx" => "embedder-campplus-multi",
+        "pyannote_segmentation_3.onnx" | "pyannote_segmentation_3_tract.onnx" => {
+            "segmenter-pyannote"
+        }
         _ => return None,
     };
     Some(id.to_string())
@@ -813,4 +962,271 @@ pub(crate) async fn save_preference(root: &Path, key: &str, value: &str) -> Resu
         .await
         .map_err(|e| IpcError::storage(format!("failed to write preferences: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod llm_selection_tests {
+    use super::*;
+
+    const QWEN_4B: &str = "models/llm/Qwen3-4B-Q4_K_M.gguf";
+    const QWEN_14B: &str = "models/llm/Qwen3-14B-Q4_K_M.gguf";
+    const GEMMA_E4B: &str = "models/llm/gemma-4-E4B-it-qat-q4_0.gguf";
+    const GEMMA_12B: &str = "models/llm/gemma-4-12B-it-qat-q4_0.gguf";
+
+    /// Fresh empty data root under the system temp dir, removed on drop.
+    pub(super) struct Root(pub(super) PathBuf);
+
+    impl Root {
+        pub(super) fn new(name: &str) -> Self {
+            // The counter keeps two roots of one test binary apart even
+            // when their names and clock readings coincide.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "echonote-llm-{name}-{}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        pub(super) fn install(&self, rel: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        fn prefer(&self, rel: &str) {
+            self.prefer_for("llm", rel);
+        }
+
+        pub(super) fn prefer_for(&self, key: &str, rel: &str) {
+            std::fs::write(
+                self.0.join("model_preferences.json"),
+                format!("{{\"{key}\":\"{rel}\"}}"),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn nothing_installed_keeps_the_qwen_14b_default() {
+        let root = Root::new("none");
+        assert_eq!(preferred_llm_model(&root.0), QWEN_14B);
+    }
+
+    #[test]
+    fn qwen_wins_over_gemma_when_the_user_has_not_chosen() {
+        let root = Root::new("default");
+        root.install(GEMMA_12B);
+        root.install(GEMMA_E4B);
+        root.install(QWEN_4B);
+        assert_eq!(preferred_llm_model(&root.0), QWEN_4B);
+    }
+
+    #[test]
+    fn gemma_is_used_when_selected_and_still_downloaded() {
+        for gemma in [GEMMA_E4B, GEMMA_12B] {
+            let root = Root::new("chosen");
+            root.install(QWEN_4B);
+            root.install(gemma);
+            root.prefer(gemma);
+            assert_eq!(preferred_llm_model(&root.0), gemma);
+        }
+    }
+
+    #[test]
+    fn a_selected_gemma_that_was_deleted_falls_back_to_what_is_installed() {
+        let root = Root::new("deleted");
+        root.install(QWEN_4B);
+        root.prefer(GEMMA_12B);
+        assert_eq!(preferred_llm_model(&root.0), QWEN_4B);
+    }
+
+    #[test]
+    fn gemma_alone_is_better_than_no_model() {
+        let root = Root::new("only-gemma");
+        root.install(GEMMA_E4B);
+        assert_eq!(preferred_llm_model(&root.0), GEMMA_E4B);
+    }
+}
+
+#[cfg(test)]
+mod embedder_selection_tests {
+    use super::llm_selection_tests::Root;
+    use super::*;
+    use echo_diarize::EmbedderFamily;
+
+    const MULTI: &str = "models/embedder/campplus_zh_en_common_advanced.onnx";
+    const CAM_EN: &str = "models/embedder/campplus_en_voxceleb.onnx";
+    const ERES2NET: &str = "models/embedder/eres2net_en_voxceleb.onnx";
+
+    #[test]
+    fn multilingual_campplus_is_the_default_when_installed() {
+        let root = Root::new("embed-default");
+        root.install(ERES2NET);
+        root.install(CAM_EN);
+        root.install(MULTI);
+        assert_eq!(preferred_embed_model(&root.0), MULTI);
+    }
+
+    #[test]
+    fn a_saved_preference_still_wins() {
+        let root = Root::new("embed-chosen");
+        root.install(MULTI);
+        root.install(CAM_EN);
+        root.prefer_for("embedder", CAM_EN);
+        assert_eq!(preferred_embed_model(&root.0), CAM_EN);
+    }
+
+    #[test]
+    fn without_the_multilingual_model_the_old_order_applies() {
+        let root = Root::new("embed-fallback");
+        root.install(ERES2NET);
+        root.install(CAM_EN);
+        assert_eq!(preferred_embed_model(&root.0), CAM_EN);
+        let empty = Root::new("embed-none");
+        assert_eq!(preferred_embed_model(&empty.0), ERES2NET);
+    }
+
+    #[test]
+    fn files_outside_the_catalog_fall_back_to_the_name_heuristic() {
+        for (name, family) in [
+            (
+                "my_campplus_multi.onnx",
+                EmbedderFamily::CamPlusPlusMultilingual,
+            ),
+            ("custom_campplus.onnx", EmbedderFamily::CamPlusPlus),
+            ("something_else.onnx", EmbedderFamily::Eres2Net),
+        ] {
+            let path = Path::new("/elsewhere").join(name);
+            assert_eq!(path_to_catalog_id(&path), None, "{name}");
+            assert_eq!(embedder_family(&path), family, "{name}");
+        }
+    }
+
+    #[test]
+    fn diarizer_config_comes_from_the_shared_presets() {
+        for rel in [MULTI, CAM_EN, ERES2NET] {
+            let path = Path::new("/data").join(rel);
+            let family = embedder_family(&path);
+            let (got_family, cluster, refine, mode) = diarizer_preset(&path, None, None);
+            assert_eq!(got_family, family, "{rel}");
+            assert_eq!(cluster, family.cluster_config(None), "{rel}");
+            assert_eq!(
+                refine.merge_threshold,
+                family.refine_config().merge_threshold,
+                "{rel}"
+            );
+            assert_eq!(mode, family.refine_mode(), "{rel}");
+            let (_, overridden, _, _) = diarizer_preset(&path, Some(0.42), None);
+            assert_eq!(overridden, family.cluster_config(Some(0.42)), "{rel}");
+            let (_, _, _, mode) = diarizer_preset(
+                &path,
+                None,
+                Some(echo_diarize::OfflineRefineMode::Resegment),
+            );
+            assert_eq!(mode, echo_diarize::OfflineRefineMode::Resegment, "{rel}");
+        }
+    }
+
+    #[test]
+    fn the_shell_keeps_no_second_threshold_table() {
+        // Thresholds live in `echo_diarize::presets`; production code
+        // here must not build cluster configs by hand.
+        let src = include_str!("mod.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        for needle in [
+            "OnlineClusterConfig {",
+            "similarity_threshold:",
+            "merge_threshold:",
+        ] {
+            assert!(
+                !production.contains(needle),
+                "src-tauri/src/commands/mod.rs builds `{needle}` by hand"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_upgrade_tests {
+    use super::llm_selection_tests::Root;
+    use super::*;
+
+    const TRACT: &str = "models/segmenter/pyannote_segmentation_3_tract.onnx";
+    const UPSTREAM: &str = "models/segmenter/pyannote_segmentation_3.onnx";
+
+    #[test]
+    fn a_fresh_install_expects_the_tract_segmenter_the_catalog_downloads() {
+        // Resolved at startup: with nothing installed the path must be the
+        // catalog destination, so a download is picked up without restart.
+        let root = Root::new("seg-none");
+        assert_eq!(preferred_segmenter_model(&root.0), TRACT);
+    }
+
+    #[test]
+    fn the_upstream_segmenter_is_used_only_when_it_is_all_there_is() {
+        let root = Root::new("seg-upstream-only");
+        root.install(UPSTREAM);
+        assert_eq!(preferred_segmenter_model(&root.0), UPSTREAM);
+        root.install(TRACT);
+        assert_eq!(preferred_segmenter_model(&root.0), TRACT);
+    }
+
+    #[test]
+    fn a_tract_segmenter_downloaded_after_startup_replaces_the_upstream_one() {
+        let root = Root::new("seg-late");
+        root.install(UPSTREAM);
+        let configured = root.0.join(UPSTREAM);
+        assert_eq!(
+            session_segmenter_path(&root.0, &configured, false),
+            configured
+        );
+        root.install(TRACT);
+        assert_eq!(
+            session_segmenter_path(&root.0, &configured, false),
+            root.0.join(TRACT)
+        );
+        let custom = root.0.join("custom.onnx");
+        assert_eq!(session_segmenter_path(&root.0, &custom, false), custom);
+    }
+
+    #[test]
+    fn an_explicit_segmenter_override_is_never_replaced() {
+        // ECHO_SEG_MODEL pointing at the upstream export stays, even once
+        // the tract file is installed.
+        let root = Root::new("seg-explicit");
+        root.install(UPSTREAM);
+        root.install(TRACT);
+        let explicit = root.0.join(UPSTREAM);
+        assert_eq!(session_segmenter_path(&root.0, &explicit, true), explicit);
+    }
+
+    #[test]
+    fn an_outdated_vad_that_fails_to_load_falls_back_to_the_rms_gate() {
+        let path = Path::new("/data/models/vad/silero_vad.onnx");
+        let failed = || Err::<u8, _>(IpcError::new(ErrorCode::Vad, "optimize: shape"));
+        assert!(matches!(vad_load_outcome(false, failed(), path), Ok(None)));
+        // A pinned v6.2 build that fails is a real error, not an upgrade gap.
+        assert!(vad_load_outcome(true, failed(), path).is_err());
+        // An outdated build that still loads keeps working.
+        assert!(matches!(
+            vad_load_outcome(false, Ok(7_u8), path),
+            Ok(Some(7))
+        ));
+        assert!(matches!(
+            vad_load_outcome(true, Ok(7_u8), path),
+            Ok(Some(7))
+        ));
+    }
 }

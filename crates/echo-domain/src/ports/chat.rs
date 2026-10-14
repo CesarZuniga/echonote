@@ -66,6 +66,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
+use super::llm::{estimate_tokens, DEFAULT_CONTEXT_WINDOW};
 use crate::DomainError;
 
 /// Author of a single message in a chat exchange.
@@ -89,12 +90,24 @@ pub enum ChatRole {
     Assistant,
 }
 
+impl ChatRole {
+    /// The role name every chat template and the OpenAI message format
+    /// use (`system`, `user`, `assistant`); identical to the serde form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
 /// A single message inside a [`ChatRequest`].
 ///
-/// `content` is plain UTF-8 text — adapters that need a different chat
-/// template format (Qwen's `<|im_start|>system\n…<|im_end|>`, Llama's
-/// `[INST] … [/INST]`, …) wrap each `ChatMessage` accordingly. The
-/// domain layer stays template-agnostic.
+/// `content` is plain UTF-8 text — adapters wrap each `ChatMessage` in
+/// the framing of the loaded model's chat template. The domain layer
+/// stays template-agnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
@@ -135,6 +148,39 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new(ChatRole::Assistant, content)
     }
+}
+
+/// Render `messages` as ChatML text, primed for the next assistant turn.
+///
+/// This is the single hard-coded template of the workspace: the default of
+/// [`crate::LlmModel::generate_chat`] / [`crate::LlmModel::count_chat_tokens`]
+/// (fakes, adapters without a template) and the fallback of adapters whose
+/// model carries no usable chat template. Real adapters render with the
+/// model's own template instead.
+///
+/// ```text
+/// <|im_start|>system
+/// {system}<|im_end|>
+/// <|im_start|>user
+/// {user}<|im_end|>
+/// <|im_start|>assistant
+/// ```
+///
+/// The trailing `<|im_start|>assistant\n` has no closing `<|im_end|>`: it
+/// primes the model to write the next assistant turn.
+#[must_use]
+pub fn render_chatml(messages: &[ChatMessage]) -> String {
+    let mut out =
+        String::with_capacity(messages.iter().map(|m| m.content.len() + 32).sum::<usize>() + 64);
+    for msg in messages {
+        out.push_str("<|im_start|>");
+        out.push_str(msg.role.as_str());
+        out.push('\n');
+        out.push_str(&msg.content);
+        out.push_str("<|im_end|>\n");
+    }
+    out.push_str("<|im_start|>assistant\n");
+    out
 }
 
 /// Knobs the application layer can pass on every chat call.
@@ -187,9 +233,8 @@ impl Default for ChatOptions {
 /// that order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
-    /// Full conversation, in chronological order. Adapters MUST treat
-    /// this as already-templated content and feed it through their
-    /// chat template verbatim.
+    /// Full conversation, in chronological order. Adapters render it
+    /// with the loaded model's chat template.
     pub messages: Vec<ChatMessage>,
     /// Sampling and length knobs for this turn.
     pub options: ChatOptions,
@@ -249,6 +294,31 @@ pub trait ChatAssistant: Send + Sync {
     /// [`crate::LlmModel::model_id`] does for summaries. Examples:
     /// `"qwen3-14b-instruct-q4_k_m"`, `"llama-3.2-3b-instruct-q4_k_m"`.
     fn model_id(&self) -> &str;
+
+    /// Size of the context window in tokens, shared by the whole
+    /// request (messages plus the reply). The use case sizes the
+    /// transcript block against it. Same contract and default as
+    /// [`crate::LlmModel::context_window`].
+    fn context_window(&self) -> u32 {
+        DEFAULT_CONTEXT_WINDOW
+    }
+
+    /// Number of tokens `text` occupies for this model. Same contract
+    /// and conservative bytes/2 default as [`crate::LlmModel::count_tokens`].
+    fn count_tokens(&self, text: &str) -> usize {
+        estimate_tokens(text)
+    }
+
+    /// Number of tokens the conversation `messages` occupies once the
+    /// adapter has rendered it with its chat template (framing tokens and
+    /// the assistant prime included).
+    ///
+    /// The default counts the [`render_chatml`] rendering with
+    /// [`Self::count_tokens`]. Adapters SHOULD override it so budgets
+    /// follow the template of the loaded model.
+    fn count_chat_tokens(&self, messages: &[ChatMessage]) -> usize {
+        self.count_tokens(&render_chatml(messages))
+    }
 
     /// Run one chat turn and return a stream of [`ChatToken`]s.
     ///
@@ -338,6 +408,14 @@ mod tests {
     }
 
     #[test]
+    fn chat_role_as_str_matches_the_serde_form() {
+        for role in [ChatRole::System, ChatRole::User, ChatRole::Assistant] {
+            let json = serde_json::to_string(&role).unwrap();
+            assert_eq!(json, format!("\"{}\"", role.as_str()));
+        }
+    }
+
+    #[test]
     fn chat_token_round_trips_with_camelcase() {
         // Tokens cross the IPC boundary on every model step; the
         // shape has to stay tiny and stable.
@@ -385,6 +463,47 @@ mod tests {
             let tokens = self.tokens.clone();
             Ok(stream::iter(tokens.into_iter().map(Ok)).boxed())
         }
+    }
+
+    #[test]
+    fn render_chatml_emits_full_template_with_assistant_prime() {
+        let msgs = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("Hi."),
+            ChatMessage::assistant("Hello!"),
+            ChatMessage::user("What's 2+2?"),
+        ];
+        let expected = "\
+<|im_start|>system
+You are helpful.<|im_end|>
+<|im_start|>user
+Hi.<|im_end|>
+<|im_start|>assistant
+Hello!<|im_end|>
+<|im_start|>user
+What's 2+2?<|im_end|>
+<|im_start|>assistant
+";
+        assert_eq!(render_chatml(&msgs), expected);
+    }
+
+    #[test]
+    fn chat_count_chat_tokens_defaults_to_counting_the_rendered_prompt() {
+        let assistant = MockChatAssistant::new(vec![]);
+        let msgs = [ChatMessage::user("abcdefg")];
+        assert_eq!(
+            assistant.count_chat_tokens(&msgs),
+            assistant.count_tokens(&render_chatml(&msgs))
+        );
+    }
+
+    #[test]
+    fn token_budget_defaults_are_conservative() {
+        // `MockChatAssistant` overrides nothing, so it exercises the
+        // trait defaults every fake relies on.
+        let assistant = MockChatAssistant::new(vec![]);
+        assert_eq!(assistant.context_window(), 8_192);
+        assert_eq!(assistant.count_tokens("abcdefg"), 4);
     }
 
     #[tokio::test]

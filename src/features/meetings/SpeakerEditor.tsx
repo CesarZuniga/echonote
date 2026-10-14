@@ -58,8 +58,8 @@ export const SpeakerEditor = memo(function SpeakerEditor({
             e.currentTarget.blur();
           }
         }}
-        aria-label={t("speakers.rename", { name: displayName(speaker) })}
-        className="w-28 bg-transparent outline-none placeholder:text-current placeholder:opacity-60"
+        aria-label={t("speakers.rename", { name: displayName(speaker, t) })}
+        className="w-28 bg-transparent outline-hidden placeholder:text-current placeholder:opacity-60"
       />
       {talkTimePct != null && talkTimePct > 0 && (
         <span className="ml-0.5 tabular-nums opacity-70">{talkTimePct}%</span>

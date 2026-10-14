@@ -11,15 +11,28 @@
 //!   single-chunk bouncing between speakers, but can delay genuine
 //!   turn detection by one chunk.
 //!
-//! Once the session finishes we hold *all* embeddings and can do a
-//! proper **agglomerative hierarchical clustering (AHC)** pass:
+//! Once the session finishes we hold *all* segment-level embeddings and
+//! can do a proper **agglomerative hierarchical clustering (AHC)** pass:
 //!
-//! 1. Compute the unweighted mean embedding for each online speaker.
-//! 2. Build a speaker × speaker cosine-similarity matrix.
-//! 3. Repeatedly merge the most-similar pair above `merge_threshold`
-//!    until no such pair exists (complete linkage AHC).
-//! 4. Return a list of `(absorbed_speaker_id, surviving_speaker_id)`
+//! 1. Group every accumulated embedding under its online speaker,
+//!    dropping speakers below `min_embeddings`.
+//! 2. Repeatedly merge the pair of groups with the highest
+//!    **average-linkage** similarity (the mean cosine over *all*
+//!    cross-group segment pairs) while it clears `merge_threshold`.
+//! 3. Return a list of `(absorbed_speaker_id, surviving_speaker_id)`
 //!    pairs. The caller applies these to all stored segments.
+//!
+//! ## Why average-linkage over segments, not mean-to-mean?
+//!
+//! An earlier version collapsed each speaker to a single mean embedding
+//! and compared means. That throws away intra-speaker variance and lets
+//! one skewed segment drag the centroid across the merge threshold —
+//! the exact failure mode of single-mic Spanish audio, where distinct
+//! speakers already sit in the hot 0.80–0.90 cosine band. Average-
+//! linkage scores a candidate merge from the *whole distribution* of
+//! cross-speaker segment pairs, so a handful of coincidentally-close
+//! segments no longer forces a merge, and a genuine over-split (where
+//! most pairs are close) still collapses.
 //!
 //! ## When this helps
 //!
@@ -35,21 +48,21 @@
 //!
 //! This pass only *merges* clusters; it does not split them.  A
 //! genuinely mis-merged pair from the online pass cannot be recovered
-//! here.  Splitting requires a segmentation model (see the planned
-//! pyannote adapter in the roadmap).
+//! here; [`crate::resegment`] relabels every span instead
+//! (`OfflineRefineMode::Resegment`, ADR 0001).
 
 use echo_domain::{Speaker, SpeakerId};
 use tracing::info;
 
-use crate::embedding::{cosine_similarity, l2_normalize};
+use crate::embedding::l2_normalize;
 
 /// Configuration for [`refine_speakers`].
 #[derive(Debug, Clone, Copy)]
 pub struct OfflineRefineConfig {
-    /// Cosine similarity above which two offline cluster means are
-    /// merged. Should be slightly higher than the online
-    /// `merge_threshold` because offline means are less noisy than
-    /// EMA centroids on short chunks.
+    /// Average-linkage cosine similarity above which two speaker groups
+    /// are merged. Should be slightly higher than the online
+    /// `merge_threshold` because the full-session view is less noisy
+    /// than EMA centroids on short chunks.
     pub merge_threshold: f32,
     /// Minimum number of embeddings a speaker must have contributed
     /// to participate in the offline pass. Speakers with fewer
@@ -61,22 +74,44 @@ pub struct OfflineRefineConfig {
 impl Default for OfflineRefineConfig {
     fn default() -> Self {
         Self {
-            merge_threshold: 0.75,
+            // Conservative fallback for embedders without a calibrated
+            // preset (EN CAM++, ERes2Net): it matches the EN CAM++ online
+            // threshold and rarely merges. Calibrated families override
+            // it in `echo_diarize::presets` (multilingual CAM++: 0.50,
+            // DER-calibrated on held-out data; at 0.85 the pass never
+            // merged anything in the T6 benchmark).
+            merge_threshold: 0.85,
             min_embeddings: 2,
         }
     }
 }
 
-/// One per online speaker: the unweighted mean of all embeddings
-/// assigned to that speaker during streaming.
+/// A group of segment-level embeddings the AHC pass treats as one
+/// speaker. Starts as a single online speaker and accretes members as
+/// groups merge.
+///
+/// The group keeps the sum of its members' unit vectors instead of the
+/// members themselves: for unit vectors the mean cosine over every
+/// cross-group pair (average linkage) is `dot(sum_a, sum_b) / (n_a * n_b)`,
+/// so the pass needs O(groups x dim) memory and no pairwise matrix,
+/// whatever the log length (ADR 0001, Q3).
 #[derive(Debug)]
-struct OfflineCluster {
+struct SegmentGroup {
+    /// Surviving speaker id — the representative that absorbed ids fold
+    /// into.
     id: SpeakerId,
-    /// L2-normalised mean embedding computed from all records assigned
-    /// to this speaker. `None` when the speaker had fewer embeddings
-    /// than `min_embeddings`.
-    mean: Option<Vec<f32>>,
+    /// Sum of the members' L2-normalised embeddings, in f64 so thousands
+    /// of members add up without visible rounding.
+    sum: Vec<f64>,
+    /// Number of members.
     count: usize,
+}
+
+/// Mean cosine over every cross-group segment pair (average-linkage).
+fn average_linkage(a: &SegmentGroup, b: &SegmentGroup) -> f32 {
+    debug_assert!(a.count > 0 && b.count > 0);
+    let dot: f64 = a.sum.iter().zip(&b.sum).map(|(x, y)| x * y).sum();
+    (dot / (a.count as f64 * b.count as f64)) as f32
 }
 
 /// Re-cluster the accumulated streaming embeddings and return a list
@@ -97,8 +132,8 @@ struct OfflineCluster {
 /// The caller should walk the list and update segment speaker labels
 /// accordingly, replacing every occurrence of `absorbed_id` with
 /// `surviving_id`. The list may be empty when no merges were found.
-pub fn refine_speakers(
-    records: &[(Vec<f32>, SpeakerId)],
+pub fn refine_speakers<E: AsRef<[f32]>>(
+    records: &[(E, SpeakerId)],
     speakers: &[Speaker],
     config: OfflineRefineConfig,
 ) -> Vec<(SpeakerId, SpeakerId)> {
@@ -106,94 +141,80 @@ pub fn refine_speakers(
         return Vec::new();
     }
 
-    // Build unweighted mean embeddings per speaker, in slot order so
-    // the AHC tie-break is deterministic.
-    let mut clusters: Vec<OfflineCluster> = speakers
-        .iter()
-        .map(|s| OfflineCluster {
+    // One group per speaker that cleared `min_embeddings`, in slot order
+    // so tie-breaks are deterministic. Members enter as unit vectors, as
+    // `cosine_similarity` would see them.
+    let mut groups: Vec<SegmentGroup> = Vec::new();
+    for s in speakers {
+        let mut group = SegmentGroup {
             id: s.id,
-            mean: None,
+            sum: Vec::new(),
             count: 0,
-        })
-        .collect();
-
-    let dim = records[0].0.len();
-
-    for (emb, speaker_id) in records {
-        let Some(c) = clusters.iter_mut().find(|c| c.id == *speaker_id) else {
-            continue;
         };
-        let mean = c.mean.get_or_insert_with(|| vec![0.0_f32; dim]);
-        for (m, &x) in mean.iter_mut().zip(emb.iter()) {
-            *m += x;
-        }
-        c.count += 1;
-    }
-
-    // Normalise each mean.
-    for c in &mut clusters {
-        if c.count < config.min_embeddings {
-            c.mean = None;
-            continue;
-        }
-        if let Some(ref mut m) = c.mean {
-            let inv = 1.0 / c.count as f32;
-            for x in m.iter_mut() {
-                *x *= inv;
+        for (e, sid) in records {
+            if *sid != s.id {
+                continue;
             }
-            l2_normalize(m);
+            let mut unit = e.as_ref().to_vec();
+            l2_normalize(&mut unit);
+            if group.sum.is_empty() {
+                group.sum = vec![0.0; unit.len()];
+            }
+            for (acc, x) in group.sum.iter_mut().zip(&unit) {
+                *acc += f64::from(*x);
+            }
+            group.count += 1;
+        }
+        if group.count >= config.min_embeddings && group.count > 0 {
+            groups.push(group);
         }
     }
 
-    // AHC: greedily merge the most-similar pair above the threshold.
+    if groups.len() < 2 {
+        return Vec::new();
+    }
+
+    // AHC: greedily merge the highest average-linkage pair above the
+    // threshold until none remain.
     let mut merges: Vec<(SpeakerId, SpeakerId)> = Vec::new();
 
     loop {
-        // Find the pair (i, j) with highest cosine similarity, i < j.
+        // Find the pair (i, j), i < j, with the highest average-linkage.
         let mut best: Option<(usize, usize, f32)> = None;
-        for i in 0..clusters.len() {
-            for j in (i + 1)..clusters.len() {
-                let (Some(mi), Some(mj)) = (&clusters[i].mean, &clusters[j].mean) else {
-                    continue;
-                };
-                let sim = cosine_similarity(mi, mj);
-                if sim >= config.merge_threshold && best.as_ref().is_none_or(|&(_, _, b)| sim > b) {
-                    best = Some((i, j, sim));
+        for i in 0..groups.len() {
+            for j in (i + 1)..groups.len() {
+                let link = average_linkage(&groups[i], &groups[j]);
+                if link >= config.merge_threshold && best.as_ref().is_none_or(|&(_, _, b)| link > b)
+                {
+                    best = Some((i, j, link));
                 }
             }
         }
 
-        let Some((i, j, sim)) = best else { break };
+        let Some((i, j, link)) = best else { break };
 
-        // Keep the cluster with more observations (earlier slot on tie).
-        let (keep, absorb) = if clusters[i].count >= clusters[j].count {
+        // Keep the larger group (earlier slot on tie, since i < j).
+        let (keep, absorb) = if groups[i].count >= groups[j].count {
             (i, j)
         } else {
             (j, i)
         };
 
-        let absorbed_id = clusters[absorb].id;
-        let surviving_id = clusters[keep].id;
+        let absorbed_id = groups[absorb].id;
+        let surviving_id = groups[keep].id;
 
-        // Weighted merge of the means.
-        let nk = clusters[keep].count as f32;
-        let na = clusters[absorb].count as f32;
-        let total = nk + na;
-        let absorb_mean = clusters[absorb].mean.clone().unwrap_or_default();
-        if let Some(ref mut km) = clusters[keep].mean {
-            for (slot, &x) in km.iter_mut().zip(absorb_mean.iter()) {
-                *slot = (*slot * nk + x * na) / total;
-            }
-            l2_normalize(km);
+        let absorbed = groups.remove(absorb);
+        let keep = if absorb < keep { keep - 1 } else { keep };
+        for (acc, x) in groups[keep].sum.iter_mut().zip(&absorbed.sum) {
+            *acc += x;
         }
-        clusters[keep].count = clusters[keep].count.saturating_add(clusters[absorb].count);
-        clusters.remove(absorb);
+        groups[keep].count += absorbed.count;
 
         info!(
             absorbed = %absorbed_id,
             surviving = %surviving_id,
-            cosine = %format!("{sim:.3}"),
-            remaining = clusters.len(),
+            avg_linkage = %format!("{link:.3}"),
+            remaining = groups.len(),
             "offline AHC merged speakers"
         );
 
@@ -220,7 +241,7 @@ mod tests {
     #[test]
     fn no_records_returns_empty() {
         let speakers = vec![make_speaker(0), make_speaker(1)];
-        let result = refine_speakers(&[], &speakers, OfflineRefineConfig::default());
+        let result = refine_speakers::<Vec<f32>>(&[], &speakers, OfflineRefineConfig::default());
         assert!(result.is_empty());
     }
 
@@ -279,6 +300,70 @@ mod tests {
         // a has count=2, b has count=2 — tie → keep earlier slot (a).
         assert_eq!(surviving, a.id);
         assert_eq!(absorbed, b.id);
+    }
+
+    #[test]
+    fn average_linkage_does_not_merge_on_a_close_mean_alone() {
+        let a = make_speaker(0);
+        let b = make_speaker(1);
+        // Group A sits at 0°; group B straddles 20°/40°, so its *mean*
+        // lands at 30° (cos ≈ 0.866 vs A) — a mean-to-mean pass would
+        // merge at threshold 0.86. But averaged over every A×B segment
+        // pair the linkage is only ≈0.853, so average-linkage must not.
+        let records = vec![
+            (unit_vec(0.0), a.id),
+            (unit_vec(0.0), a.id),
+            (unit_vec(20.0), b.id),
+            (unit_vec(40.0), b.id),
+        ];
+        let result = refine_speakers(
+            &records,
+            &[a, b],
+            OfflineRefineConfig {
+                merge_threshold: 0.86,
+                min_embeddings: 2,
+            },
+        );
+        assert!(
+            result.is_empty(),
+            "average-linkage must not merge on a coincidentally-close mean"
+        );
+    }
+
+    #[test]
+    fn chained_over_splits_collapse_into_one() {
+        let a = make_speaker(0);
+        let b = make_speaker(1);
+        let c = make_speaker(2);
+        // Three online clusters of the same speaker within a few degrees
+        // — every cross pair clears the threshold, so all three collapse.
+        let records = vec![
+            (unit_vec(0.0), a.id),
+            (unit_vec(1.0), a.id),
+            (unit_vec(2.0), b.id),
+            (unit_vec(3.0), b.id),
+            (unit_vec(4.0), c.id),
+            (unit_vec(5.0), c.id),
+        ];
+        let result = refine_speakers(
+            &records,
+            &[a.clone(), b.clone(), c.clone()],
+            OfflineRefineConfig {
+                merge_threshold: 0.9,
+                min_embeddings: 2,
+            },
+        );
+        // Two merges fold three groups into one; the earliest slot (a)
+        // survives every merge.
+        assert_eq!(result.len(), 2, "three groups need two merges");
+        for (_, surviving) in &result {
+            assert_eq!(*surviving, a.id, "everything folds into slot 0");
+        }
+        let absorbed: std::collections::HashSet<_> = result.iter().map(|(x, _)| *x).collect();
+        assert!(
+            absorbed.contains(&b.id) && absorbed.contains(&c.id),
+            "both b and c must be absorbed"
+        );
     }
 
     #[test]

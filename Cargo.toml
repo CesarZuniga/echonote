@@ -25,9 +25,9 @@ members = [
 # Shared package metadata inherited by member crates via `package.xxx.workspace = true`
 # -----------------------------------------------------------------------------
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.99"
 authors = ["Luis MC <luismctechdev@gmail.com>"]
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/luismctech/echonote"
@@ -109,9 +109,9 @@ encoding_rs = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
 # Type-safe IPC bindings (tauri-specta)
-specta = { version = "=2.0.0-rc.22", features = ["derive", "uuid", "time", "function"] }
-specta-typescript = "0.0.9"
-tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+specta = { version = "=2.0.0-rc.25", features = ["derive", "uuid", "time", "function"] }
+specta-typescript = "0.0.12"
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 
 # Testing
 pretty_assertions = "1.4"

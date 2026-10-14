@@ -6,9 +6,13 @@
 //!
 //! ```sh
 //! ./scripts/download-models.sh llm
-//! ECHO_LLM_MODEL=$(pwd)/models/llm/qwen2.5-7b-instruct-q4_k_m.gguf \
-//!   cargo test -p echo-llm --test llama_smoke -- --ignored --nocapture
+//! ECHO_LLM_MODEL=$(pwd)/models/llm/Qwen3-8B-Q4_K_M.gguf \
+//!   cargo test -p echo-llm --test llama_smoke -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Keep `--test-threads=1`: each test loads its own copy of the model, and
+//! loading several multi-GB copies at once can fail on machines with
+//! limited memory.
 //!
 //! The point of the smoke test is to prove the FFI bridge, Metal/CPU
 //! backend, model loading, sampler chain and stop-sequence handling
@@ -16,10 +20,15 @@
 //! quantization- and seed-sensitive). We only assert shape and timing.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use echo_domain::{GenerateOptions, LlmModel};
+use echo_domain::{
+    ChatAssistant, ChatMessage, ChatOptions, ChatRequest, GenerateOptions, LlmModel,
+};
 use echo_llm::{LlamaCppLlm, LoadOptions};
+use futures::StreamExt;
 
 fn model_from_env() -> Option<PathBuf> {
     let raw = std::env::var("ECHO_LLM_MODEL").ok()?;
@@ -54,13 +63,10 @@ async fn loads_model_and_completes_a_short_greedy_prompt() {
 
     assert_eq!(llm.model_id(), "smoke");
 
-    // Use the Qwen chat template — works on Qwen 2 / 2.5 / 3 GGUFs.
-    // For other model families this prompt is harmless raw text and
-    // the model will continue it; the test only cares that we get a
-    // non-empty completion back.
-    let prompt = "<|im_start|>system\nYou are a helpful assistant. Answer with a single short sentence.<|im_end|>\n\
-                  <|im_start|>user\nReply with the literal word OK and nothing else.<|im_end|>\n\
-                  <|im_start|>assistant\n";
+    // Qwen keeps the legacy hand-written ChatML; other families get the
+    // prompt their own template renders.
+    let prompt = short_prompt(&llm, "Reply with the literal word OK and nothing else.");
+    let prompt = prompt.as_str();
 
     let opts = GenerateOptions {
         max_tokens: 16,
@@ -97,10 +103,672 @@ async fn loads_model_and_completes_a_short_greedy_prompt() {
     );
 }
 
+#[test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+fn reports_real_context_window_and_token_counts() {
+    let Some(model_path) = model_from_env() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+
+    let llm = LlamaCppLlm::load_with(
+        &model_path,
+        LoadOptions::default().with_n_ctx(2_048).with_n_threads(4),
+    )
+    .expect("load gguf");
+    let chat = llm.chat_handle();
+
+    assert_eq!(llm.context_window(), 2_048);
+    assert_eq!(chat.context_window(), 2_048);
+
+    let text = "Decidimos lanzar la versión nueva el lunes por la mañana.";
+    let real = llm.count_tokens(text);
+    assert!(real > 0, "a non-empty text must tokenize to something");
+    assert_eq!(chat.count_tokens(text), real);
+    assert_eq!(llm.count_tokens(""), 0);
+}
+
 #[tokio::test]
 #[ignore = "requires ECHO_LLM_MODEL"]
 async fn rejects_missing_model_path() {
     let bogus = PathBuf::from("/tmp/this/path/should/not/exist.gguf");
     let err = LlamaCppLlm::load(&bogus).unwrap_err();
     assert!(matches!(err, echo_domain::DomainError::ModelNotLoaded(_)));
+}
+
+/// Evidence for the `estimate_tokens` contract: on every sample, including
+/// the accent-dense worst case, the real tokenizer count must not exceed
+/// the fallback estimate, or budgets built on the fallback could overflow.
+#[test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+fn fallback_estimate_is_never_below_the_real_token_count() {
+    let Some(model_path) = model_from_env() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    let llm = LlamaCppLlm::load_with(
+        &model_path,
+        LoadOptions::default().with_n_ctx(2_048).with_n_threads(4),
+    )
+    .expect("load gguf");
+    let samples = [
+        "Decidimos lanzar la versión nueva el lunes por la mañana.",
+        "Además, la configuración de producción necesitará aprobación: ¿quién se encargará de la migración?",
+        "Ñandú, canción, pingüino, acción, información, característica, económicamente, comunicación.",
+        "Ana: Sí, también revisé la planificación del trimestre y creo que deberíamos reorganizar las prioridades según la capacidad del equipo.",
+        "We decided to launch the new version on Monday morning and review the rollout plan afterwards.",
+        "Speaker 2: The quarterly numbers look fine, but the infrastructure budget needs another review.",
+        "Reunión técnica sobre la implementación de microservicios, contenedores y orquestación en la nube.",
+        "áéíóúñ áéíóúñ áéíóúñ áéíóúñ áéíóúñ áéíóúñ áéíóúñ áéíóúñ",
+    ];
+    for text in samples {
+        let real = llm.count_tokens(text);
+        let estimate = echo_domain::estimate_tokens(text);
+        eprintln!(
+            "real={real} estimate={estimate} chars={} bytes={}",
+            text.chars().count(),
+            text.len()
+        );
+        assert!(real <= estimate, "estimate undercounts {text:?}");
+    }
+}
+
+/// Whether the loaded model is the Qwen family, whose raw prompts these
+/// tests keep as hand-written ChatML (the legacy golden). Every other
+/// family goes through the adapter's own renderer so the prompt carries its
+/// real framing (BOS, turn markers).
+fn is_qwen(llm: &LlamaCppLlm) -> bool {
+    llm.prompt_format_name() == "Qwen"
+}
+
+fn short_prompt(llm: &LlamaCppLlm, question: &str) -> String {
+    if is_qwen(llm) {
+        return format!(
+            "<|im_start|>system\nAnswer with a single short sentence.<|im_end|>\n\
+             <|im_start|>user\n{question} /no_think<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+    let messages = [
+        ChatMessage::system("Answer with a single short sentence."),
+        ChatMessage::user(question),
+    ];
+    llm.rendered_chat_prompt(&messages).0
+}
+
+fn greedy_options(max_tokens: u32) -> GenerateOptions {
+    GenerateOptions {
+        max_tokens,
+        temperature: 0.0,
+        top_p: 1.0,
+        seed: Some(7),
+        stop: vec!["<|im_end|>".into()],
+    }
+}
+
+/// The persistent context must serve consecutive requests, and clearing
+/// the KV cache between them must make a repeated greedy prompt reproduce
+/// the same answer.
+#[tokio::test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+async fn serves_back_to_back_requests_on_one_context() {
+    let Some(model_path) = model_from_env() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    let llm = LlamaCppLlm::load_with(
+        &model_path,
+        LoadOptions::default().with_n_ctx(2_048).with_n_threads(4),
+    )
+    .expect("load gguf");
+
+    let capital = short_prompt(&llm, "What is the capital of France?");
+    let first = llm
+        .generate(&capital, &greedy_options(24))
+        .await
+        .expect("first request");
+    let other = llm
+        .generate(&short_prompt(&llm, "What is 2 + 2?"), &greedy_options(24))
+        .await
+        .expect("second request");
+    let again = llm
+        .generate(&capital, &greedy_options(24))
+        .await
+        .expect("third request");
+    eprintln!("back-to-back: {first:?} / {other:?} / {again:?}");
+
+    assert!(!first.trim().is_empty());
+    assert!(!other.trim().is_empty());
+    assert_eq!(first, again, "a reused context must not leak earlier state");
+}
+
+/// Dropping a stream mid-answer must stop its decoding so the next
+/// request is served instead of waiting behind a long generation.
+#[tokio::test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+async fn dropping_a_stream_early_does_not_block_the_next_request() {
+    let Some(model_path) = model_from_env() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    let llm = LlamaCppLlm::load_with(
+        &model_path,
+        LoadOptions::default().with_n_ctx(2_048).with_n_threads(4),
+    )
+    .expect("load gguf");
+
+    // A long answer requested, abandoned after the first piece.
+    let long = short_prompt(&llm, "Count from 1 to 500 separated by commas.");
+    let mut stream = llm
+        .generate_stream(&long, &greedy_options(512))
+        .await
+        .expect("open stream");
+    let piece = stream.next().await.expect("first piece").expect("ok piece");
+    assert!(!piece.is_empty());
+    drop(stream);
+
+    let started = Instant::now();
+    let out = llm
+        .generate(
+            &short_prompt(&llm, "Reply with the word OK."),
+            &greedy_options(16),
+        )
+        .await
+        .expect("request after the dropped stream");
+    let elapsed = started.elapsed();
+    eprintln!("after drop: {out:?} in {} ms", elapsed.as_millis());
+
+    assert!(!out.trim().is_empty());
+    // Cancellation is asserted deterministically by the worker unit tests
+    // (`a_queued_job_whose_consumer_is_gone_is_skipped` and the sink
+    // tests); here it is enough that the next request completes.
+    eprintln!("next request completed after {elapsed:?}");
+}
+
+/// A chat turn submitted while a long summary-like workload runs is served
+/// between its `generate` calls instead of after all of them.
+#[tokio::test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+async fn chat_is_served_between_background_generate_calls() {
+    let Some(model_path) = model_from_env() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    let llm = LlamaCppLlm::load_with(
+        &model_path,
+        LoadOptions::default().with_n_ctx(2_048).with_n_threads(4),
+    )
+    .expect("load gguf");
+    let chat = llm.chat_handle();
+
+    // A map-reduce-like workload: many separate `generate` calls.
+    const BACKGROUND_CALLS: usize = 6;
+    let calls_done = Arc::new(AtomicUsize::new(0));
+    let background = {
+        let llm = llm.clone();
+        let calls_done = Arc::clone(&calls_done);
+        tokio::spawn(async move {
+            for i in 0..BACKGROUND_CALLS {
+                let prompt = short_prompt(&llm, &format!("Count from 1 to 400, variant {i}."));
+                llm.generate(&prompt, &greedy_options(128))
+                    .await
+                    .expect("background call");
+                calls_done.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+    // Let the first call start decoding.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let request = ChatRequest {
+        messages: vec![ChatMessage::user("Reply with the word OK. /no_think")],
+        options: ChatOptions {
+            max_tokens: 16,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: Some(7),
+            stop: vec!["<|im_end|>".into()],
+        },
+    };
+    let asked = Instant::now();
+    let mut stream = chat.ask(&request).await.expect("ask");
+    let first = stream.next().await.expect("first token").expect("ok token");
+    let first_token_after = asked.elapsed();
+    let done_at_first_token = calls_done.load(Ordering::SeqCst);
+    while stream.next().await.is_some() {}
+    eprintln!(
+        "chat first token {first:?} after {} ms with {done_at_first_token}/{BACKGROUND_CALLS} \
+         background calls done; chat total {} ms",
+        first_token_after.as_millis(),
+        asked.elapsed().as_millis()
+    );
+
+    assert!(
+        done_at_first_token < BACKGROUND_CALLS,
+        "chat waited for the whole background workload"
+    );
+    assert!(!background.is_finished(), "background finished before chat");
+    background.await.expect("background task");
+}
+
+/// Long shared system prompt so prompts built on it share a real prefix.
+fn shared_system() -> String {
+    let mut text = String::from("You are a careful meeting assistant. Meeting notes follow.\n");
+    for i in 0..40 {
+        text.push_str(&format!(
+            "Note {i}: the team reviewed milestone {i}, assigned an owner and set a date.\n"
+        ));
+    }
+    text
+}
+
+fn chatml_turns(system: &str, turns: &[(&str, Option<&str>)]) -> String {
+    let mut prompt = format!("<|im_start|>system\n{system}<|im_end|>\n");
+    for (user, answer) in turns {
+        prompt.push_str(&format!("<|im_start|>user\n{user} /no_think<|im_end|>\n"));
+        prompt.push_str("<|im_start|>assistant\n");
+        if let Some(answer) = answer {
+            prompt.push_str(&format!("{answer}<|im_end|>\n"));
+        }
+    }
+    prompt
+}
+
+/// Conversation prompt for `llm`: legacy ChatML for Qwen, the model's own
+/// rendering otherwise. `turns` are `(user, answer)` pairs; a missing answer
+/// leaves the assistant turn open.
+fn turns_prompt(llm: &LlamaCppLlm, system: &str, turns: &[(&str, Option<&str>)]) -> String {
+    if is_qwen(llm) {
+        return chatml_turns(system, turns);
+    }
+    let mut messages = vec![ChatMessage::system(system)];
+    for (user, answer) in turns {
+        messages.push(ChatMessage::user(*user));
+        if let Some(answer) = answer {
+            messages.push(ChatMessage::assistant(*answer));
+        }
+    }
+    llm.rendered_chat_prompt(&messages).0
+}
+
+fn load_small() -> Option<LlamaCppLlm> {
+    let model_path = model_from_env()?;
+    Some(
+        LlamaCppLlm::load_with(
+            &model_path,
+            LoadOptions::default().with_n_ctx(4_096).with_n_threads(4),
+        )
+        .expect("load gguf"),
+    )
+}
+
+/// Output with reuse must match the cold run exactly. Reuse feeds the model
+/// the same tokens and greedy decoding is deterministic, so the texts are
+/// identical on the backend this suite is validated on (Metal).
+///
+/// llama.cpp kernels are not guaranteed to be bitwise-invariant across
+/// batch shapes, and reuse evaluates the prefix under a different shape
+/// than a cold run. A mismatch on another backend must therefore be
+/// investigated (stale KV state versus numeric drift), not ignored; the
+/// failure reports the first divergence and both texts to make that
+/// possible.
+fn assert_equivalent(cold: &str, warm: &str, what: &str) {
+    if cold == warm {
+        return;
+    }
+    let at = first_divergence(cold, warm);
+    panic!(
+        "{what}: output diverged from the cold run at char {at}\n cold: {cold:?}\n warm: {warm:?}\n\
+         llama.cpp kernels are not guaranteed bitwise-invariant across batch shapes: on a \
+         backend other than Metal, investigate whether this is numeric drift or a stale KV \
+         state instead of ignoring it"
+    );
+}
+
+/// Char index of the first difference between `a` and `b`. When one is a
+/// strict prefix of the other, that is the shorter length.
+fn first_divergence(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .position(|(x, y)| x != y)
+        .unwrap_or_else(|| a.chars().count().min(b.chars().count()))
+}
+
+/// A prompt that partially overlaps the one left in the KV cache must
+/// produce the same greedy output as the same prompt on a fresh worker with
+/// an empty cache (see [`assert_equivalent`]).
+#[tokio::test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+async fn prefix_reuse_matches_a_cold_cache() {
+    let Some(warm) = load_small() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    let system = shared_system();
+    let target = turns_prompt(
+        &warm,
+        &system,
+        &[("Which milestone has the latest date?", None)],
+    );
+    let other = turns_prompt(
+        &warm,
+        &system,
+        &[("Summarise note 3 in one sentence.", None)],
+    );
+
+    // (a) cold: a fresh worker, empty cache.
+    let cold_llm = load_small().expect("model");
+    let cold = cold_llm
+        .generate(&target, &greedy_options(48))
+        .await
+        .expect("cold");
+    assert_eq!(cold_llm.last_reused_tokens(), 0, "cold run reuses nothing");
+
+    // (b) warm: a different prompt first, so the cache holds an
+    // overlapping prefix (the shared system prompt).
+    warm.generate(&other, &greedy_options(48))
+        .await
+        .expect("other");
+    let reused_other = warm.last_reused_tokens();
+    let hot = warm
+        .generate(&target, &greedy_options(48))
+        .await
+        .expect("warm");
+    let reused = warm.last_reused_tokens();
+    eprintln!(
+        "[prefix] reused {reused} of {} tokens",
+        warm.count_tokens(&target)
+    );
+    eprintln!("[prefix] cold {cold:?}\n[prefix] warm {hot:?}");
+    assert_eq!(reused_other, 0, "first request on a fresh worker");
+    assert!(
+        reused > 100,
+        "shared system prompt should be reused: {reused}"
+    );
+    assert!(!cold.trim().is_empty());
+    assert_equivalent(&cold, &hot, "prefix reuse");
+
+    // An identical repeat reuses everything but the last token.
+    let again = warm
+        .generate(&target, &greedy_options(48))
+        .await
+        .expect("repeat");
+    assert_eq!(warm.last_reused_tokens(), warm.count_tokens(&target) - 1);
+    assert_equivalent(&cold, &again, "identical repeat");
+}
+
+/// Chat turn 2 (turn 1 prompt + its answer + a new user message) reuses at
+/// least the whole turn 1 prompt and answers exactly like a cold run.
+#[tokio::test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+async fn chat_turn_two_reuses_turn_one_and_matches_a_cold_run() {
+    let Some(llm) = load_small() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    let system = shared_system();
+    let q1 = "Which milestone has the latest date?";
+    let p1 = turns_prompt(&llm, &system, &[(q1, None)]);
+    let a1 = llm
+        .generate(&p1, &greedy_options(48))
+        .await
+        .expect("turn 1");
+    let p2 = turns_prompt(&llm, &system, &[(q1, Some(&a1)), ("Who owns it?", None)]);
+    let n1 = llm.count_tokens(&p1);
+
+    let warm = llm
+        .generate(&p2, &greedy_options(48))
+        .await
+        .expect("turn 2");
+    let reused = llm.last_reused_tokens();
+    eprintln!("[chat] turn 1 prompt {n1} tokens, turn 2 reused {reused}");
+    if p2.starts_with(&p1) {
+        assert!(reused >= n1, "turn 2 reused {reused} < turn 1 prompt {n1}");
+    } else {
+        // Some templates end the generation prompt with a marker that the
+        // same turn rendered as history omits (Gemma 4 12B writes an empty
+        // `<|channel>thought\n<channel|>` there). Reuse then covers the text
+        // the two prompts share, give or take one token where the cut falls.
+        let shared = p1
+            .char_indices()
+            .zip(p2.chars())
+            .find(|&((_, a), b)| a != b)
+            .map_or(p1.len(), |((at, _), _)| at);
+        let n_shared = llm.count_tokens(&p1[..shared]);
+        eprintln!("[chat] shared prefix {n_shared} of {n1} tokens");
+        assert!(
+            reused + 1 >= n_shared,
+            "turn 2 reused {reused} < shared prefix {n_shared}"
+        );
+    }
+
+    let cold_llm = load_small().expect("model");
+    let cold = cold_llm
+        .generate(&p2, &greedy_options(48))
+        .await
+        .expect("cold turn 2");
+    assert_equivalent(&cold, &warm, "chat turn 2");
+}
+
+/// The Qwen GGUF is detected as the Qwen family, and `generate_chat`
+/// sends exactly the ChatML prompt the app used to build by hand (with
+/// `/no_think` on the last user turn).
+///
+/// The model's own Jinja template is rendered too and compared, to document
+/// why Qwen keeps the ChatML path: with thinking off, Qwen3's template adds
+/// an empty `<think>` block after the assistant prime.
+#[tokio::test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+async fn qwen_is_detected_and_renders_the_legacy_chatml_prompt() {
+    let Some(llm) = load_small() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    if !is_qwen(&llm) {
+        eprintln!(
+            "skipping: {} is not a Qwen model (family {})",
+            llm.model_path().display(),
+            llm.prompt_format_name()
+        );
+        return;
+    }
+    assert_eq!(llm.prompt_rendering_name(), "ChatMl");
+
+    let messages = [
+        ChatMessage::system("You are a careful meeting assistant."),
+        ChatMessage::user("Which milestone has the latest date?"),
+        ChatMessage::assistant("Milestone 7."),
+        ChatMessage::user("And the earliest?"),
+    ];
+    let (prompt, stops) = llm.rendered_chat_prompt(&messages);
+    let legacy = "<|im_start|>system\nYou are a careful meeting assistant.<|im_end|>\n\
+                  <|im_start|>user\nWhich milestone has the latest date?<|im_end|>\n\
+                  <|im_start|>assistant\nMilestone 7.<|im_end|>\n\
+                  <|im_start|>user\nAnd the earliest?\n/no_think<|im_end|>\n\
+                  <|im_start|>assistant\n";
+    assert_eq!(prompt, legacy);
+    assert_eq!(stops, vec!["<|im_end|>".to_string()]);
+
+    match llm.jinja_chat_prompt(&messages) {
+        Ok(jinja) => {
+            eprintln!("[template] jinja == chatml (no /no_think): {}", {
+                let plain = echo_domain::render_chatml(&messages);
+                jinja == plain
+            });
+            eprintln!("[template] jinja prompt: {jinja:?}");
+        }
+        Err(e) => eprintln!("[template] jinja render failed: {e}"),
+    }
+
+    // The structured entry point answers like the raw prompt does.
+    let opts = greedy_options(24);
+    let via_messages = llm.generate_chat(&messages, &opts).await.expect("chat");
+    let via_raw = llm.generate(&prompt, &opts).await.expect("raw");
+    assert_eq!(via_messages, via_raw);
+}
+
+/// Control tokens a user types into message content must not reach the
+/// tokenizer as real tokens: the adapter strips them before rendering.
+///
+/// Family-agnostic: the hostile strings are the loaded model's own
+/// special-token texts (preferring the ones its template writes as framing,
+/// so the check is meaningful), and "survive" means the rendered prompt
+/// holds more occurrences of a token than a benign render of the same
+/// conversation does.
+#[tokio::test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+async fn model_special_tokens_in_message_content_do_not_survive_rendering() {
+    let Some(llm) = load_small() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    let specials = llm.special_token_texts();
+    assert!(
+        !specials.is_empty(),
+        "the vocabulary yields special-token texts"
+    );
+    let render = |system: &str, user: &str| {
+        llm.rendered_chat_prompt(&[ChatMessage::system(system), ChatMessage::user(user)])
+            .0
+    };
+    let baseline = render("sysQQ", "okQQdone");
+    let framing = specials.iter().filter(|s| baseline.contains(s.as_str()));
+    let rest = specials.iter().filter(|s| !baseline.contains(s.as_str()));
+    let hostile: Vec<&String> = framing.chain(rest).take(4).collect();
+    eprintln!("[special] injecting {hostile:?} (of {})", specials.len());
+
+    // Separators keep the stripped halves from splicing a new token.
+    let user = format!(
+        "ok{}QQ{}QQ{}QQ{}done",
+        hostile[0],
+        hostile.get(1).map_or("", |s| s.as_str()),
+        hostile.get(2).map_or("", |s| s.as_str()),
+        hostile.get(3).map_or("", |s| s.as_str()),
+    );
+    let system = format!("sys{}QQ", hostile[0]);
+    let prompt = render(&system, &user);
+    for token in &hostile {
+        assert_eq!(
+            prompt.matches(token.as_str()).count(),
+            baseline.matches(token.as_str()).count(),
+            "{token:?} survived in {prompt:?}"
+        );
+    }
+    assert!(prompt.contains("okQQQQQQdone"), "{prompt:?}");
+    if is_qwen(&llm) {
+        // Only the framing the template writes: system, user and the
+        // assistant prime.
+        assert_eq!(prompt.matches("<|im_start|>").count(), 3, "{prompt:?}");
+    }
+}
+
+/// Gemma 4 is detected from the GGUF and rendered with its own Jinja
+/// template: native system role, `<|turn>` framing, assistant as `model`,
+/// exactly one BOS token (added by the tokenizer), and the turn-end stop. Skips on other families.
+#[tokio::test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+async fn gemma4_renders_with_its_own_template_and_exactly_one_bos() {
+    let Some(llm) = load_small() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    if llm.prompt_format_name() != "Gemma4" {
+        eprintln!(
+            "skipping: family {} is not Gemma4",
+            llm.prompt_format_name()
+        );
+        return;
+    }
+    eprintln!(
+        "[gemma4] rendering {}, {} special-token texts",
+        llm.prompt_rendering_name(),
+        llm.special_token_count()
+    );
+    assert_eq!(llm.prompt_rendering_name(), "Jinja");
+
+    let messages = [
+        ChatMessage::system("You are a careful meeting assistant."),
+        ChatMessage::user("Which milestone has the latest date?"),
+        ChatMessage::assistant("Milestone 7."),
+        ChatMessage::user("And the earliest?"),
+    ];
+    let (prompt, stops) = llm.rendered_chat_prompt(&messages);
+    eprintln!(
+        "[gemma4] prompt: {prompt:?}
+[gemma4] stops: {stops:?}"
+    );
+    // llama.cpp strips the template's `<bos>` for vocabularies that want a
+    // BOS (`add_bos_token`), so the text starts at the first turn.
+    assert!(prompt.starts_with("<|turn>system\n"), "{prompt:?}");
+    assert!(prompt.contains("<|turn>user\n"), "{prompt:?}");
+    assert!(prompt.contains("<|turn>model\n"), "{prompt:?}");
+    assert!(!prompt.contains("/no_think"), "{prompt:?}");
+    assert!(stops.iter().any(|s| s == "<turn|>"), "{stops:?}");
+
+    // Exactly one BOS token reaches the model: tokenizing adds it once, an
+    // explicit leading `<bos>` collapses into it, and only a second explicit
+    // one would make a difference.
+    let n = llm.count_tokens(&prompt);
+    assert_eq!(
+        llm.count_tokens(&format!("<bos>{prompt}")),
+        n,
+        "BOS missing"
+    );
+    assert_eq!(
+        llm.count_tokens(&format!("<bos><bos>{prompt}")),
+        n + 1,
+        "more than one BOS"
+    );
+
+    // The structured entry point answers (and never leaks reasoning markers).
+    let out = llm
+        .generate_chat(&messages, &greedy_options(24))
+        .await
+        .expect("chat");
+    eprintln!("[gemma4] answer: {out:?}");
+    assert!(!out.trim().is_empty());
+    assert!(
+        !out.contains("<|channel>") && !out.contains("<turn|>"),
+        "{out:?}"
+    );
+}
+
+/// Prompt tokenization adds exactly the BOS the vocabulary wants and never an
+/// EOS, whatever the GGUF's `add_eos_token` says (Qwen: no BOS; Gemma: one BOS).
+#[test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+fn prompt_tokens_carry_the_vocabulary_bos_and_never_an_eos() {
+    let Some(llm) = load_small() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+    let (bos, eos) = llm.bos_eos_ids();
+    let (add_bos, llama_adds_eos) = llm.bos_policy();
+    eprintln!(
+        "[bos] family {} bos={bos} eos={eos} add_bos={add_bos} llama.cpp add_special would append EOS: {llama_adds_eos}",
+        llm.prompt_format_name()
+    );
+    for text in ["Hola mundo", "<bos>Hola mundo", "Hola <|im_end|>"] {
+        let ids = llm.prompt_token_ids(text);
+        eprintln!("[bos] {text:?} -> {ids:?}");
+        assert!(!ids.is_empty());
+        let boses = ids.iter().filter(|&&i| i == bos).count();
+        // `<bos>` is a control token only where the vocabulary wants a BOS
+        // (Qwen has no such token: the text is plain).
+        let explicit = usize::from(add_bos && text.starts_with("<bos>"));
+        // The automatic BOS is added once and merges with an explicit one.
+        assert_eq!(boses, usize::from(add_bos).max(explicit), "{ids:?}");
+        assert_eq!(ids[0] == bos, add_bos || explicit == 1, "{ids:?}");
+        if !text.contains("<|im_end|>") {
+            assert_ne!(*ids.last().unwrap(), eos, "EOS appended: {ids:?}");
+        }
+    }
+    assert!(llm.prompt_token_ids("").is_empty());
+    // Qwen: no BOS wanted, so the count is the bare tokenization.
+    if llm.prompt_format_name() == "Qwen" {
+        assert!(!add_bos);
+    }
+    if llm.prompt_format_name() == "Gemma4" {
+        assert!(add_bos);
+    }
 }

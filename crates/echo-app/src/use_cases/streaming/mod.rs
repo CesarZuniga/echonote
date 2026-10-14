@@ -10,18 +10,34 @@
 //!                                   (mpsc channel)
 //! ```
 //!
-//! The pipeline buffers raw frames at the device sample rate, flushes a
-//! "chunk" every [`StreamingOptions::chunk_ms`] of audio, runs the
-//! buffered chunk through the resampler and the transcriber, then emits
-//! a [`TranscriptEvent::Chunk`] (or [`TranscriptEvent::Skipped`] when
-//! the chunk is below the silence floor).
+//! The pipeline buffers raw frames at the device sample rate and cuts
+//! them into chunks, runs each chunk through the resampler and the
+//! transcriber, then emits a [`TranscriptEvent::Chunk`] (or
+//! [`TranscriptEvent::Skipped`] when the chunk holds no speech).
+//!
+//! Chunking policy:
+//!
+//! - **Speech-aligned** (a VAD is attached and
+//!   [`StreamingOptions::speech_aligned_chunks`] is set, the default):
+//!   the VAD runs incrementally over the buffer and chunks end at
+//!   speech pauses between [`StreamingOptions::min_chunk_ms`] and
+//!   [`StreamingOptions::max_chunk_ms`]; silence between utterances is
+//!   reported as skipped and never transcribed (see `chunker`).
+//! - **Fixed**: a chunk every [`StreamingOptions::chunk_ms`], gated by
+//!   the VAD per chunk when one is attached, by the RMS floor otherwise.
+//!
+//! Chunk offsets are derived from the device frames actually emitted,
+//! so segment timestamps stay exact with variable-length chunks.
+//! Pausing flushes the buffered audio first; paused audio is not part
+//! of session time.
 //!
 //! Backpressure: a single ASR call is in flight at a time. If the
 //! transcriber is slower than real time the next chunk waits — the UI
 //! sees this as growing latency rather than dropped audio. A drop
 //! policy can be added in Sprint 1 once metrics are wired.
 
-mod sample_pool;
+mod chunker;
+mod refine;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,11 +47,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use chunker::{ChunkBounds, Cut, SpeechTimeline, TimedFrame};
 use echo_domain::{
-    AudioCapture, AudioFormat, CaptureSpec, Diarizer, DomainError, Punctuator, Resampler, Sample,
-    SpeakerId, StreamingOptions, StreamingSessionId, TranscribeOptions, Transcriber,
-    TranscriptEvent, Vad, VoiceState,
+    AudioCapture, AudioFormat, CaptureSpec, ChunkContext, Diarizer, DomainError, Punctuator,
+    RefineOutcome, Resampler, Sample, SpeakerId, SpeakerMerge, SpeakerRef, SpeakerSpan,
+    StreamingOptions, StreamingSessionId, TranscribeOptions, Transcriber, TranscriptEvent, Vad,
+    VoiceState,
 };
+pub use refine::DEFAULT_REFINE_TIMEOUT;
+use refine::{refine_at_stop, AttributionLedger};
 
 /// Capacity of the event channel. ~10 minutes of headroom for a
 /// 5-second chunk cadence; if consumers are slower than that we have a
@@ -70,11 +90,12 @@ pub struct StreamingPipeline {
     /// [`TranscriptEvent::Chunk`]. Skipped chunks bypass diarization.
     diarizer: Option<Box<dyn Diarizer>>,
     /// Optional neural Voice Activity Detector. When set, the pipeline
-    /// pushes every resampled chunk through it **in chronological
-    /// order** (the LSTM state is sequence-sensitive) and only sends
-    /// chunks classified as `Voiced` to the transcriber. Chunks the
-    /// VAD calls `Silence` are emitted as `TranscriptEvent::Skipped`,
-    /// same as the energy-based RMS gate.
+    /// pushes all audio through it **in chronological order** (the
+    /// LSTM state is sequence-sensitive). With speech-aligned chunking
+    /// (the default) it decides where chunks end and which stretches
+    /// are silence; with fixed chunks it gates each chunk. Either way
+    /// silence is emitted as `TranscriptEvent::Skipped`, same as the
+    /// energy-based RMS gate, and never reaches the transcriber.
     ///
     /// When this is set the cheap RMS gate is bypassed — Silero is
     /// strictly more discriminating (rejects pure tones, fans, music
@@ -87,6 +108,8 @@ pub struct StreamingPipeline {
     /// (Whisper large-v3-turbo produces reasonable punctuation on its
     /// own; the restorer is most valuable for small/fast models).
     punctuator: Option<Arc<dyn Punctuator>>,
+    /// Hard limit on the end-of-session diarization refine.
+    refine_timeout: Duration,
 }
 
 impl StreamingPipeline {
@@ -103,7 +126,18 @@ impl StreamingPipeline {
             diarizer: None,
             vad: None,
             punctuator: None,
+            refine_timeout: DEFAULT_REFINE_TIMEOUT,
         }
+    }
+
+    /// Override the end-of-session refine deadline
+    /// ([`DEFAULT_REFINE_TIMEOUT`] by default). When the refine fails or
+    /// runs out of time, the online speaker attribution stands and
+    /// `Stopped` is still emitted.
+    #[must_use]
+    pub fn with_refine_timeout(mut self, timeout: Duration) -> Self {
+        self.refine_timeout = timeout;
+        self
     }
 
     /// Attach a diarizer. Call once before `start*`. The diarizer must
@@ -149,6 +183,27 @@ impl StreamingPipeline {
         spec: CaptureSpec,
         options: StreamingOptions,
     ) -> Result<StreamingHandle, StreamingError> {
+        self.start_inner(PipelineSource::Spec(spec), options).await
+    }
+
+    /// Start transcription with an already-started audio stream. Use this
+    /// when the caller needs to start the capture itself (e.g. to retain
+    /// [`MixControls`] for a `Mixed` session) and then hand the stream off
+    /// to the pipeline.
+    pub async fn start_with_stream(
+        self,
+        stream: Box<dyn echo_domain::AudioStream>,
+        options: StreamingOptions,
+    ) -> Result<StreamingHandle, StreamingError> {
+        self.start_inner(PipelineSource::Prestarted(stream), options)
+            .await
+    }
+
+    async fn start_inner(
+        self,
+        source: PipelineSource,
+        options: StreamingOptions,
+    ) -> Result<StreamingHandle, StreamingError> {
         let session_id = StreamingSessionId::new();
         let (event_tx, event_rx) = mpsc::channel::<TranscriptEvent>(EVENT_CHANNEL_CAPACITY);
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -175,6 +230,16 @@ impl StreamingPipeline {
             }
         }
 
+        if self.vad.is_some()
+            && options.speech_aligned_chunks
+            && (options.min_chunk_ms == 0 || options.min_chunk_ms > options.max_chunk_ms)
+        {
+            return Err(StreamingError::Domain(DomainError::Invariant(format!(
+                "speech-aligned chunk bounds must satisfy 0 < min_chunk_ms ({}) <= max_chunk_ms ({})",
+                options.min_chunk_ms, options.max_chunk_ms
+            ))));
+        }
+
         let paused = Arc::new(AtomicBool::new(false));
 
         let join = tokio::spawn(run_pipeline(
@@ -185,11 +250,12 @@ impl StreamingPipeline {
             self.vad,
             self.punctuator,
             session_id,
-            spec,
+            source,
             options,
             event_tx,
             stop_rx,
             Arc::clone(&paused),
+            self.refine_timeout,
         ));
 
         Ok(StreamingHandle {
@@ -200,6 +266,14 @@ impl StreamingPipeline {
             paused,
         })
     }
+}
+
+/// Describes how a pipeline session obtains its audio stream.
+enum PipelineSource {
+    /// Derive the stream by calling `capture.start(spec)` inside the pipeline task.
+    Spec(CaptureSpec),
+    /// Use a stream that was already started by the caller.
+    Prestarted(Box<dyn echo_domain::AudioStream>),
 }
 
 /// Whisper's canonical sample rate. Inlined here to avoid pulling
@@ -286,15 +360,16 @@ async fn run_pipeline(
     capture: Arc<dyn AudioCapture>,
     resampler: Arc<dyn Resampler>,
     transcriber: Arc<dyn Transcriber>,
-    mut diarizer: Option<Box<dyn Diarizer>>,
+    diarizer: Option<Box<dyn Diarizer>>,
     mut vad: Option<Box<dyn Vad>>,
     punctuator: Option<Arc<dyn Punctuator>>,
     session_id: StreamingSessionId,
-    spec: CaptureSpec,
+    source: PipelineSource,
     options: StreamingOptions,
     events: mpsc::Sender<TranscriptEvent>,
     mut stop_rx: oneshot::Receiver<()>,
     paused: Arc<AtomicBool>,
+    refine_timeout: Duration,
 ) {
     info!(%session_id, vad_enabled = vad.is_some(), "streaming pipeline starting");
 
@@ -304,18 +379,21 @@ async fn run_pipeline(
         v.reset();
     }
 
-    let mut stream = match capture.start(spec).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, "capture.start failed");
-            let _ = events
-                .send(TranscriptEvent::Failed {
-                    session_id,
-                    message: format!("capture failed to start: {e}"),
-                })
-                .await;
-            return;
-        }
+    let mut stream = match source {
+        PipelineSource::Spec(spec) => match capture.start(spec).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "capture.start failed");
+                let _ = events
+                    .send(TranscriptEvent::Failed {
+                        session_id,
+                        message: format!("capture failed to start: {e}"),
+                    })
+                    .await;
+                return;
+            }
+        },
+        PipelineSource::Prestarted(s) => s,
     };
 
     let format = stream.format();
@@ -326,122 +404,143 @@ async fn run_pipeline(
         })
         .await;
 
-    let chunk_samples = chunk_size_in_samples(format, options.chunk_ms);
-    let transcribe_options = TranscribeOptions {
-        language: options.language.clone(),
-        ..Default::default()
+    let mut chunker = Chunker::new(vad, format, &options);
+    let mut emitter = ChunkEmitter {
+        resampler,
+        transcriber,
+        diarizer,
+        punctuator,
+        session_id,
+        format,
+        transcribe_options: TranscribeOptions {
+            language: options.language.clone(),
+            ..Default::default()
+        },
+        silence_threshold: options.silence_rms_threshold,
+        events: events.clone(),
+        chunk_index: 0,
+        emitted_frames: 0,
+        total_segments: 0,
+        epoch: 0,
+        ledger: AttributionLedger::default(),
     };
+    info!(%session_id, speech_aligned = chunker.is_speech_aligned(), "chunking policy");
 
-    let mut pool = sample_pool::SamplePool::new(chunk_samples);
-    let mut buffer: Vec<Sample> = Vec::with_capacity(chunk_samples);
-    let mut chunk_index: u32 = 0;
-    let mut total_audio_ms: u32 = 0;
-    let mut total_segments: u32 = 0;
+    let mut buffer: Vec<Sample> = Vec::new();
     let pipeline_started = Instant::now();
     let mut was_paused = false;
 
     loop {
-        tokio::select! {
+        let frame = tokio::select! {
             biased;
             _ = &mut stop_rx => {
                 debug!(%session_id, "stop signal received");
                 break;
             }
-            frame = stream.next_frame() => {
-                match frame {
-                    Some(f) => buffer.extend_from_slice(&f.samples),
-                    None => {
-                        debug!(%session_id, "capture stream ended");
-                        break;
-                    }
+            frame = stream.next_frame() => match frame {
+                Some(f) => f,
+                None => {
+                    debug!(%session_id, "capture stream ended");
+                    break;
                 }
-            }
-        }
+            },
+        };
 
         let is_paused = paused.load(Ordering::Acquire);
 
         // Emit state-change events exactly once per transition.
         if is_paused && !was_paused {
             debug!(%session_id, "pipeline paused");
+            // Transcribe what was captured before the pause instead of
+            // dropping it, then report the pause.
+            chunker.flush(&mut buffer, &mut emitter).await;
             let _ = events.send(TranscriptEvent::Paused { session_id }).await;
             was_paused = true;
         } else if !is_paused && was_paused {
             debug!(%session_id, "pipeline resumed");
             // Reset VAD hidden state — the LSTM would be stale after
             // the gap, producing unreliable voice/silence decisions.
-            if let Some(v) = vad.as_deref_mut() {
-                v.reset();
-            }
+            chunker.reset_vad();
+            // Audio before and after the pause is not contiguous: the
+            // diarizer's log must not treat it as one run.
+            emitter.epoch = emitter.epoch.saturating_add(1);
             let _ = events.send(TranscriptEvent::Resumed { session_id }).await;
             was_paused = false;
         }
 
-        // While paused, discard all buffered audio so the pipeline
-        // doesn't accumulate a backlog that would explode on resume.
+        // While paused, discard incoming audio so the pipeline doesn't
+        // accumulate a backlog that would explode on resume. Paused
+        // audio is not part of session time.
         if is_paused {
-            buffer.clear();
             continue;
         }
 
-        while buffer.len() >= chunk_samples {
-            let mut chunk_buf = pool.checkout();
-            chunk_buf.extend_from_slice(&buffer[..chunk_samples]);
-            buffer.drain(..chunk_samples);
-            let offset_ms = total_audio_ms;
-            total_audio_ms = total_audio_ms.saturating_add(options.chunk_ms);
-
-            let segs = process_chunk(
-                &resampler,
-                &transcriber,
-                &mut diarizer,
-                &mut vad,
-                punctuator.as_deref(),
-                session_id,
-                chunk_index,
-                offset_ms,
-                options.chunk_ms,
-                options.silence_rms_threshold,
-                format,
-                &chunk_buf,
-                &transcribe_options,
-                &events,
-            )
-            .await;
-            pool.checkin(chunk_buf);
-            total_segments = total_segments.saturating_add(segs);
-            chunk_index = chunk_index.saturating_add(1);
-        }
+        buffer.extend_from_slice(&frame.samples);
+        chunker.drain_ready(&mut buffer, &mut emitter).await;
     }
 
     if let Err(e) = stream.stop().await {
         warn!(error = %e, "stream.stop returned an error");
     }
 
-    // Flush whatever is still buffered as a final, possibly-shorter chunk.
-    if !buffer.is_empty() {
-        let chunk_ms = samples_to_ms(buffer.len(), format);
-        let offset_ms = total_audio_ms;
-        total_audio_ms = total_audio_ms.saturating_add(chunk_ms);
-        let segs = process_chunk(
-            &resampler,
-            &transcriber,
-            &mut diarizer,
-            &mut vad,
-            punctuator.as_deref(),
-            session_id,
-            chunk_index,
-            offset_ms,
-            chunk_ms,
-            options.silence_rms_threshold,
-            format,
-            &buffer,
-            &transcribe_options,
-            &events,
-        )
-        .await;
-        total_segments = total_segments.saturating_add(segs);
+    // Flush whatever is still buffered as final, possibly-shorter chunks.
+    chunker.flush(&mut buffer, &mut emitter).await;
+
+    // Offline diarization refinement (ADR 0001, D3). ASR runs inline per
+    // chunk, so every segment was emitted before this point and the
+    // plan covers all of them. The refine runs on the blocking pool
+    // under a deadline; on any failure the online result stands.
+    if let Some(d) = emitter.diarizer.take() {
+        match refine_at_stop(d, refine_timeout, session_id).await {
+            Some((RefineOutcome::Merges(merges), _)) => {
+                let payload: Vec<SpeakerMerge> = merges
+                    .into_iter()
+                    .map(|(absorbed, surviving)| SpeakerMerge {
+                        absorbed,
+                        surviving,
+                    })
+                    .collect();
+                info!(
+                    %session_id,
+                    merges = payload.len(),
+                    "offline diarization refinement collapsed over-split speakers"
+                );
+                let _ = events
+                    .send(TranscriptEvent::SpeakersMerged {
+                        session_id,
+                        merges: payload,
+                    })
+                    .await;
+            }
+            Some((RefineOutcome::Relabel(plan), speakers)) => {
+                if let Some(r) = emitter.ledger.reassign(&plan, &speakers) {
+                    let plan_id = uuid::Uuid::now_v7();
+                    info!(
+                        %session_id,
+                        %plan_id,
+                        segments = r.segments.len(),
+                        created = r.created.len(),
+                        retired = r.retired.len(),
+                        "offline diarization re-segmentation moved segments"
+                    );
+                    let _ = events
+                        .send(TranscriptEvent::SpeakersReassigned {
+                            session_id,
+                            plan_id,
+                            created: r.created,
+                            retired: r.retired,
+                            segments: r.segments,
+                            chunks: r.chunks,
+                        })
+                        .await;
+                }
+            }
+            Some((RefineOutcome::Unchanged, _)) | None => {}
+        }
     }
 
+    let total_audio_ms = emitter.offset_ms();
+    let total_segments = emitter.total_segments;
     info!(
         %session_id,
         total_audio_ms,
@@ -459,187 +558,541 @@ async fn run_pipeline(
         .await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn process_chunk(
-    resampler: &Arc<dyn Resampler>,
-    transcriber: &Arc<dyn Transcriber>,
-    diarizer: &mut Option<Box<dyn Diarizer>>,
-    vad: &mut Option<Box<dyn Vad>>,
-    punctuator: Option<&dyn Punctuator>,
-    session_id: StreamingSessionId,
-    chunk_index: u32,
-    offset_ms: u32,
-    duration_ms: u32,
-    silence_threshold: f32,
-    format: AudioFormat,
-    raw_samples: &[Sample],
-    transcribe_options: &TranscribeOptions,
-    events: &mpsc::Sender<TranscriptEvent>,
-) -> u32 {
-    // RMS is computed up-front for telemetry (Skipped events carry it
-    // so the UI can show a meaningful "below the gate" indicator),
-    // and used as the cheap fast-path silence gate when no neural VAD
-    // is configured. When VAD *is* configured the RMS gate is bypassed
-    // — Silero distinguishes voice from non-voice noise (fans, music,
-    // pure tones) that exceed any reasonable RMS threshold, and the
-    // VAD's LSTM needs every chunk in chronological order to keep its
-    // temporal model coherent.
-    let chunk_rms = rms(raw_samples);
-    if vad.is_none() && silence_threshold > 0.0 && chunk_rms < silence_threshold {
-        debug!(%session_id, chunk_index, chunk_rms, "skipping silent chunk (RMS gate)");
-        let _ = events
-            .send(TranscriptEvent::Skipped {
-                session_id,
-                chunk_index,
-                offset_ms,
-                duration_ms,
-                rms: chunk_rms,
-            })
-            .await;
-        return 0;
-    }
+/// How the buffered audio is split into chunks.
+enum Chunker {
+    /// Every `chunk_samples`, gated per chunk by the VAD when one is
+    /// attached, by the RMS floor otherwise.
+    Fixed {
+        chunk_samples: usize,
+        vad: Option<Box<dyn Vad>>,
+    },
+    /// At speech pauses, see [`SpeechChunker`].
+    Speech(SpeechChunker),
+}
 
-    let resampled = match resampler.to_whisper(raw_samples, format) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, chunk_index, "resampler failed; dropping chunk");
-            return 0;
-        }
-    };
-
-    // Neural VAD gate runs on the resampled 16 kHz mono buffer (the
-    // sample rate Silero was trained for). We always push the chunk
-    // — even loud ones — so the LSTM hidden state stays in sync with
-    // the audio stream; the decision to skip transcription is based
-    // purely on the returned `VoiceState`.
-    if let Some(v) = vad.as_deref_mut() {
-        match v.push(&resampled).await {
-            Ok(VoiceState::Silence) => {
-                debug!(%session_id, chunk_index, chunk_rms, "skipping silent chunk (neural VAD)");
-                let _ = events
-                    .send(TranscriptEvent::Skipped {
-                        session_id,
-                        chunk_index,
-                        offset_ms,
-                        duration_ms,
-                        rms: chunk_rms,
-                    })
-                    .await;
-                return 0;
+impl Chunker {
+    fn new(vad: Option<Box<dyn Vad>>, format: AudioFormat, options: &StreamingOptions) -> Self {
+        match vad {
+            Some(vad) if options.speech_aligned_chunks => {
+                Self::Speech(SpeechChunker::new(vad, format, options))
             }
-            Ok(VoiceState::Voiced) => {
-                // Fall through to diarize + transcribe.
-            }
-            Err(e) => {
-                // VAD is best-effort: if it fails we still want to
-                // transcribe rather than silently drop the chunk.
-                warn!(error = %e, chunk_index, "VAD failed; transcribing chunk anyway");
-            }
+            vad => Self::Fixed {
+                chunk_samples: chunk_size_in_samples(format, options.chunk_ms),
+                vad,
+            },
         }
     }
 
-    // Diarize the same 16 kHz mono buffer we're about to transcribe.
-    // Done before the ASR call so the call site stays linear; the
-    // ASR call below is by far the dominant cost (RTF ≪ 1 → tens of
-    // ms vs Whisper's hundreds), so the lack of parallelism here is
-    // deliberate: keeping the borrow on `diarizer` exclusive is
-    // simpler than spawning a second task and joining.
-    let speaker = match diarizer.as_deref_mut() {
-        Some(d) => assign_speaker(d, &resampled, chunk_index, session_id).await,
-        None => None,
-    };
+    fn is_speech_aligned(&self) -> bool {
+        matches!(self, Self::Speech(_))
+    }
 
-    let asr_started = Instant::now();
-    let result = transcriber.transcribe(&resampled, transcribe_options).await;
-    let asr_elapsed = asr_started.elapsed();
-
-    match result {
-        Ok(mut transcript) => {
-            // Apply punctuation restoration before emitting so consumers
-            // receive clean, consistently-punctuated text regardless of
-            // which ASR model was active.
-            if let Some(p) = punctuator {
-                let lang = transcript.language.as_deref();
-                for seg in &mut transcript.segments {
-                    seg.text = p.punctuate(&seg.text, lang);
+    fn reset_vad(&mut self) {
+        match self {
+            Self::Fixed { vad, .. } => {
+                if let Some(v) = vad.as_deref_mut() {
+                    v.reset();
                 }
             }
-            // Make segment timestamps absolute relative to the session start.
-            for seg in &mut transcript.segments {
-                seg.start_ms = seg.start_ms.saturating_add(offset_ms);
-                seg.end_ms = seg.end_ms.saturating_add(offset_ms);
-                // Stamp the speaker on every segment in this chunk so
-                // the storage layer can persist it without needing the
-                // chunk-level event.
-                if let Some((id, _)) = speaker {
-                    seg.speaker_id = Some(id);
-                }
-            }
-            let segs = transcript.segments.len() as u32;
-            let rtf = if duration_ms == 0 {
-                0.0
-            } else {
-                (asr_elapsed.as_secs_f32())
-                    / (Duration::from_millis(u64::from(duration_ms)).as_secs_f32())
-            };
-            let _ = events
-                .send(TranscriptEvent::Chunk {
-                    session_id,
-                    chunk_index,
-                    offset_ms,
-                    segments: transcript.segments,
-                    language: transcript.language,
-                    rtf,
-                    speaker_id: speaker.map(|(id, _)| id),
-                    speaker_slot: speaker.map(|(_, slot)| slot),
-                })
-                .await;
-            segs
+            Self::Speech(s) => s.vad.reset(),
         }
-        Err(e) => {
-            warn!(error = %e, chunk_index, "transcribe failed; dropping chunk");
-            0
+    }
+
+    /// Emit every chunk the buffered audio already allows.
+    async fn drain_ready(&mut self, buffer: &mut Vec<Sample>, emitter: &mut ChunkEmitter) {
+        match self {
+            Self::Fixed { chunk_samples, vad } => {
+                while buffer.len() >= *chunk_samples {
+                    emitter
+                        .process(Gate::of(vad), &buffer[..*chunk_samples])
+                        .await;
+                    buffer.drain(..*chunk_samples);
+                }
+            }
+            Self::Speech(s) => s.drain_ready(buffer, emitter).await,
+        }
+    }
+
+    /// Emit the whole buffer (stop, pause) and leave it empty.
+    async fn flush(&mut self, buffer: &mut Vec<Sample>, emitter: &mut ChunkEmitter) {
+        match self {
+            Self::Fixed { vad, .. } => {
+                if !buffer.is_empty() {
+                    emitter.process(Gate::of(vad), buffer).await;
+                    buffer.clear();
+                }
+            }
+            Self::Speech(s) => s.flush(buffer, emitter).await,
         }
     }
 }
 
-/// Run the diarizer over `samples` and look up the assigned speaker's
-/// arrival-order slot. Returns `None` when the diarizer chose not to
-/// embed (chunk too short, low confidence, …) or errored — diarization
-/// is *strictly* best-effort, so we never abort the pipeline because
-/// of it.
-async fn assign_speaker(
+/// Audio pushed to the VAD per analysis step. Bounds the cut-decision
+/// latency and keeps resampling calls reasonably large.
+const ANALYSIS_BLOCK_MS: u32 = 200;
+
+/// Window before `max_chunk_ms` searched for the quietest forced cut.
+const FORCED_CUT_LOOKBACK_MS: u32 = 1_500;
+
+/// Silence kept before a speech onset so a late VAD decision does not
+/// clip the first phoneme.
+const SPEECH_PRE_ROLL_MS: u32 = 300;
+
+/// Cuts chunks at speech pauses. Runs the VAD incrementally over the
+/// buffer (in [`ANALYSIS_BLOCK_MS`] steps, in chronological order) and
+/// lets [`SpeechTimeline`] decide the cut points. Chunks it emits are
+/// already classified, so they bypass every per-chunk gate.
+struct SpeechChunker {
+    vad: Box<dyn Vad>,
+    bounds: ChunkBounds,
+    /// Minimum unanalysed audio before the next VAD push.
+    block: usize,
+    /// Buffer samples already pushed to the VAD.
+    analyzed: usize,
+    timeline: SpeechTimeline,
+}
+
+impl SpeechChunker {
+    fn new(vad: Box<dyn Vad>, format: AudioFormat, options: &StreamingOptions) -> Self {
+        let samples = |ms| chunk_size_in_samples(format, ms);
+        Self {
+            vad,
+            bounds: ChunkBounds {
+                min: samples(options.min_chunk_ms),
+                max: samples(options.max_chunk_ms),
+                lookback: samples(FORCED_CUT_LOOKBACK_MS),
+                pre_roll: samples(SPEECH_PRE_ROLL_MS),
+            },
+            block: samples(ANALYSIS_BLOCK_MS).max(1),
+            analyzed: 0,
+            timeline: SpeechTimeline::default(),
+        }
+    }
+
+    async fn drain_ready(&mut self, buffer: &mut Vec<Sample>, emitter: &mut ChunkEmitter) {
+        if buffer.len() - self.analyzed >= self.block {
+            self.analyze(buffer, emitter).await;
+        }
+        while let Some(cut) = self.timeline.next_cut(&self.bounds) {
+            self.emit(cut, buffer, emitter).await;
+        }
+    }
+
+    async fn flush(&mut self, buffer: &mut Vec<Sample>, emitter: &mut ChunkEmitter) {
+        if buffer.len() > self.analyzed {
+            self.analyze(buffer, emitter).await;
+        }
+        while let Some(cut) = self.timeline.final_cut(&self.bounds, buffer.len()) {
+            self.emit(cut, buffer, emitter).await;
+        }
+        buffer.clear();
+        self.timeline.clear();
+        self.analyzed = 0;
+    }
+
+    /// Push the unanalysed tail of `buffer` through the VAD and record
+    /// its frames in buffer coordinates. The VAD sees 16 kHz audio, so
+    /// frame ends are mapped back proportionally to device frames. A
+    /// failing resampler or VAD marks the block voiced: transcribing
+    /// noise is better than silently dropping speech.
+    async fn analyze(&mut self, buffer: &[Sample], emitter: &ChunkEmitter) {
+        let start = self.analyzed;
+        let block = &buffer[start..];
+        self.analyzed = buffer.len();
+        let channels = usize::from(emitter.format.channels.max(1));
+        let block_frames = block.len() / channels;
+
+        let fail_open = |timeline: &mut SpeechTimeline| {
+            timeline.push(TimedFrame {
+                end: start + block_frames * channels,
+                probability: 1.0,
+                state: VoiceState::Voiced,
+            });
+        };
+
+        let resampled = match emitter.resampler.to_whisper(block, emitter.format) {
+            Ok(r) if !r.is_empty() => r,
+            Ok(_) => return,
+            Err(e) => {
+                warn!(error = %e, "resampler failed during VAD analysis; treating block as speech");
+                fail_open(&mut self.timeline);
+                return;
+            }
+        };
+        match self.vad.push_frames(&resampled).await {
+            Ok(frames) => {
+                for f in frames {
+                    let frame_end =
+                        (f.end_sample * block_frames / resampled.len()).min(block_frames);
+                    self.timeline.push(TimedFrame {
+                        end: start + frame_end * channels,
+                        probability: f.probability,
+                        state: f.state,
+                    });
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "VAD failed; treating block as speech");
+                fail_open(&mut self.timeline);
+            }
+        }
+    }
+
+    async fn emit(&mut self, cut: Cut, buffer: &mut Vec<Sample>, emitter: &mut ChunkEmitter) {
+        let n = match cut {
+            Cut::Silence(n) | Cut::Speech(n) => n.min(buffer.len()),
+        };
+        if n == 0 {
+            // Cannot happen (frames never outrun the buffer), but an
+            // empty cut would spin the caller's loop forever.
+            self.timeline.clear();
+            return;
+        }
+        match cut {
+            Cut::Silence(_) => emitter.skip(&buffer[..n]).await,
+            Cut::Speech(_) => emitter.process(Gate::Open, &buffer[..n]).await,
+        }
+        buffer.drain(..n);
+        self.analyzed = self.analyzed.saturating_sub(n);
+        self.timeline.consume(n);
+    }
+}
+
+/// Turns chunks into events and keeps the session clock. Offsets come
+/// from the device frames actually emitted (`emitted_frames`), so
+/// variable-length chunks keep segment timestamps exact.
+struct ChunkEmitter {
+    resampler: Arc<dyn Resampler>,
+    transcriber: Arc<dyn Transcriber>,
+    diarizer: Option<Box<dyn Diarizer>>,
+    punctuator: Option<Arc<dyn Punctuator>>,
+    session_id: StreamingSessionId,
+    format: AudioFormat,
+    transcribe_options: TranscribeOptions,
+    silence_threshold: f32,
+    events: mpsc::Sender<TranscriptEvent>,
+    chunk_index: u32,
+    /// Device frames (samples per channel) emitted so far.
+    emitted_frames: u64,
+    total_segments: u32,
+    /// Capture run: 0 at start, +1 after every resume.
+    epoch: u16,
+    /// Vector-free record of every attribution, for the stop refine.
+    ledger: AttributionLedger,
+}
+
+impl ChunkEmitter {
+    /// Session time at the end of the audio emitted so far.
+    fn offset_ms(&self) -> u32 {
+        frames_to_ms(self.emitted_frames, self.format)
+    }
+
+    /// Advance the session clock and chunk index past `raw`.
+    fn advance(&mut self, raw: &[Sample]) {
+        let channels = u64::from(self.format.channels.max(1));
+        self.emitted_frames += raw.len() as u64 / channels;
+        self.chunk_index = self.chunk_index.saturating_add(1);
+    }
+
+    /// Report `raw` as skipped silence without transcribing it.
+    async fn skip(&mut self, raw: &[Sample]) {
+        let chunk_rms = rms(raw);
+        debug!(session_id = %self.session_id, chunk_index = self.chunk_index, chunk_rms, "skipping silent chunk (speech-aligned VAD)");
+        self.send_skipped(raw, chunk_rms).await;
+        self.advance(raw);
+    }
+
+    async fn send_skipped(&self, raw: &[Sample], chunk_rms: f32) {
+        let _ = self
+            .events
+            .send(TranscriptEvent::Skipped {
+                session_id: self.session_id,
+                chunk_index: self.chunk_index,
+                offset_ms: self.offset_ms(),
+                duration_ms: samples_to_ms(raw.len(), self.format),
+                rms: chunk_rms,
+            })
+            .await;
+    }
+
+    /// Gate, diarize and transcribe one chunk, then advance the clock.
+    async fn process(&mut self, gate: Gate<'_>, raw: &[Sample]) {
+        let segs = self.process_inner(gate, raw).await;
+        self.total_segments = self.total_segments.saturating_add(segs);
+        self.advance(raw);
+    }
+
+    /// Returns the number of segments emitted (0 when skipped/failed).
+    async fn process_inner(&mut self, gate: Gate<'_>, raw_samples: &[Sample]) -> u32 {
+        let session_id = self.session_id;
+        let chunk_index = self.chunk_index;
+        let offset_ms = self.offset_ms();
+        let duration_ms = samples_to_ms(raw_samples.len(), self.format);
+
+        // RMS is computed up-front for telemetry (Skipped events carry it
+        // so the UI can show a meaningful "below the gate" indicator),
+        // and used as the cheap fast-path silence gate when no neural VAD
+        // is configured. When VAD *is* configured the RMS gate is bypassed
+        // — Silero distinguishes voice from non-voice noise (fans, music,
+        // pure tones) that exceed any reasonable RMS threshold, and the
+        // VAD's LSTM needs every chunk in chronological order to keep its
+        // temporal model coherent.
+        let chunk_rms = rms(raw_samples);
+        if matches!(gate, Gate::Rms)
+            && self.silence_threshold > 0.0
+            && chunk_rms < self.silence_threshold
+        {
+            debug!(%session_id, chunk_index, chunk_rms, "skipping silent chunk (RMS gate)");
+            self.send_skipped(raw_samples, chunk_rms).await;
+            return 0;
+        }
+
+        let resampled = match self.resampler.to_whisper(raw_samples, self.format) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, chunk_index, "resampler failed; dropping chunk");
+                return 0;
+            }
+        };
+
+        // Per-chunk neural VAD gate (fixed policy) runs on the resampled
+        // 16 kHz mono buffer (the sample rate Silero was trained for). We
+        // always push the chunk — even loud ones — so the LSTM hidden
+        // state stays in sync with the audio stream; the decision to skip
+        // transcription is based purely on the returned `VoiceState`.
+        if let Gate::Vad(v) = gate {
+            match v.push(&resampled).await {
+                Ok(VoiceState::Silence) => {
+                    debug!(%session_id, chunk_index, chunk_rms, "skipping silent chunk (neural VAD)");
+                    self.send_skipped(raw_samples, chunk_rms).await;
+                    return 0;
+                }
+                Ok(VoiceState::Voiced) => {
+                    // Fall through to diarize + transcribe.
+                }
+                Err(e) => {
+                    // VAD is best-effort: if it fails we still want to
+                    // transcribe rather than silently drop the chunk.
+                    warn!(error = %e, chunk_index, "VAD failed; transcribing chunk anyway");
+                }
+            }
+        }
+
+        // Diarize the same 16 kHz mono buffer we're about to transcribe.
+        // Done before the ASR call so the call site stays linear; the
+        // ASR call below is by far the dominant cost (RTF ≪ 1 → tens of
+        // ms vs Whisper's hundreds), so the lack of parallelism here is
+        // deliberate: keeping the borrow on `diarizer` exclusive is
+        // simpler than spawning a second task and joining.
+        //
+        // `spans` may contain overlapping ranges when two speakers talk
+        // simultaneously — the segmenter inside the diarizer emits one
+        // span per active speaker per frame. We preserve those overlaps
+        // and let the per-segment attribution below pick the dominant
+        // speaker for each Whisper segment by sample-window overlap.
+        // Spans are relative to this chunk, whatever its length.
+        let ctx = ChunkContext {
+            chunk_index,
+            offset_ms,
+            epoch: self.epoch,
+        };
+        let spans = match self.diarizer.as_deref_mut() {
+            Some(d) => assign_speaker_spans(d, &resampled, ctx, session_id).await,
+            None => Vec::new(),
+        };
+
+        let asr_started = Instant::now();
+        let result = self
+            .transcriber
+            .transcribe(&resampled, &self.transcribe_options)
+            .await;
+        let asr_elapsed = asr_started.elapsed();
+
+        match result {
+            Ok(mut transcript) => {
+                // Apply punctuation restoration before emitting so consumers
+                // receive clean, consistently-punctuated text regardless of
+                // which ASR model was active.
+                if let Some(p) = self.punctuator.as_deref() {
+                    let lang = transcript.language.as_deref();
+                    for seg in &mut transcript.segments {
+                        seg.text = p.punctuate(&seg.text, lang);
+                    }
+                }
+                // Attribute each segment to the speaker whose span overlaps
+                // it the most, then shift its timestamps to session time.
+                // Order matters: speaker attribution uses chunk-local time
+                // (before the offset_ms shift) so the sample-window math
+                // lines up with the diarizer's chunk-relative spans.
+                for seg in &mut transcript.segments {
+                    if !spans.is_empty() {
+                        let sample_start = ms_to_chunk_samples(seg.start_ms);
+                        let sample_end = ms_to_chunk_samples(seg.end_ms);
+                        if let Some(id) = dominant_span(&spans, sample_start, sample_end) {
+                            seg.speaker_id = Some(id);
+                        }
+                    }
+                    seg.start_ms = seg.start_ms.saturating_add(offset_ms);
+                    seg.end_ms = seg.end_ms.saturating_add(offset_ms);
+                }
+                let segs = transcript.segments.len() as u32;
+                let rtf = if duration_ms == 0 {
+                    0.0
+                } else {
+                    (asr_elapsed.as_secs_f32())
+                        / (Duration::from_millis(u64::from(duration_ms)).as_secs_f32())
+                };
+                // Chunk-level speaker for the UI palette: dominant span
+                // across the entire chunk by sample-weighted majority.
+                let chunk_dominant = chunk_dominant_speaker(&spans);
+                self.ledger.record(
+                    chunk_index,
+                    &spans,
+                    transcript.segments.iter().map(|seg| {
+                        (
+                            seg.id,
+                            ms_to_chunk_samples(seg.start_ms.saturating_sub(offset_ms)),
+                            ms_to_chunk_samples(seg.end_ms.saturating_sub(offset_ms)),
+                            seg.speaker_id,
+                        )
+                    }),
+                    chunk_dominant.map(|(id, _)| id),
+                );
+                let speakers = referenced_speakers(&spans, chunk_dominant);
+                let _ = self
+                    .events
+                    .send(TranscriptEvent::Chunk {
+                        session_id,
+                        chunk_index,
+                        offset_ms,
+                        segments: transcript.segments,
+                        language: transcript.language,
+                        rtf,
+                        speaker_id: chunk_dominant.map(|(id, _)| id),
+                        speaker_slot: chunk_dominant.map(|(_, slot)| slot),
+                        speakers,
+                    })
+                    .await;
+                segs
+            }
+            Err(e) => {
+                warn!(error = %e, chunk_index, "transcribe failed; dropping chunk");
+                0
+            }
+        }
+    }
+}
+
+/// Per-chunk gate applied by [`ChunkEmitter::process`].
+enum Gate<'a> {
+    /// Fixed policy with a VAD: push the chunk, skip it on `Silence`.
+    Vad(&'a mut dyn Vad),
+    /// Fixed policy without a VAD: skip chunks below the RMS floor.
+    Rms,
+    /// Speech-aligned chunk, already classified as speech.
+    Open,
+}
+
+impl<'a> Gate<'a> {
+    fn of(vad: &'a mut Option<Box<dyn Vad>>) -> Self {
+        match vad.as_deref_mut() {
+            Some(v) => Self::Vad(v),
+            None => Self::Rms,
+        }
+    }
+}
+
+/// Convert chunk-local milliseconds to a chunk-local sample index at
+/// the pipeline's canonical 16 kHz rate. Used to align Whisper
+/// segments (which report time) with diarizer spans (which report
+/// sample indices) inside the same chunk.
+fn ms_to_chunk_samples(ms: u32) -> usize {
+    (u64::from(ms) * u64::from(echo_audio_whisper_rate()) / 1_000) as usize
+}
+
+/// Distinct speakers named by `spans`, in first-seen order, always
+/// including the chunk-dominant pair. Segments take their speaker from
+/// `dominant_span`, so this is a superset of every `Segment::speaker_id`
+/// in the chunk and lets the recorder persist them before the segments.
+fn referenced_speakers(
+    spans: &[SpeakerSpan],
+    chunk_dominant: Option<(SpeakerId, u32)>,
+) -> Vec<SpeakerRef> {
+    let mut out: Vec<SpeakerRef> = Vec::new();
+    let pairs = chunk_dominant
+        .into_iter()
+        .chain(spans.iter().map(|s| (s.speaker_id, s.slot)));
+    for (id, slot) in pairs {
+        if !out.iter().any(|r| r.id == id) {
+            out.push(SpeakerRef { id, slot });
+        }
+    }
+    out
+}
+
+/// Sample-weighted majority across the chunk: returns the
+/// `(SpeakerId, slot)` whose total active duration is largest. `None`
+/// when the diarizer emitted no spans.
+fn chunk_dominant_speaker(spans: &[SpeakerSpan]) -> Option<(SpeakerId, u32)> {
+    if spans.is_empty() {
+        return None;
+    }
+    let mut totals: Vec<(SpeakerId, u32, usize)> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let len = span.len_samples();
+        if let Some((_, _, acc)) = totals.iter_mut().find(|(id, _, _)| *id == span.speaker_id) {
+            *acc += len;
+        } else {
+            totals.push((span.speaker_id, span.slot, len));
+        }
+    }
+    totals
+        .into_iter()
+        .max_by_key(|(_, _, n)| *n)
+        .map(|(id, slot, _)| (id, slot))
+}
+
+/// Find the speaker whose span overlaps the `[start, end)` window the
+/// most. `None` when none of the spans intersect the window.
+fn dominant_span(spans: &[SpeakerSpan], start: usize, end: usize) -> Option<SpeakerId> {
+    let mut best: Option<(SpeakerId, usize)> = None;
+    for span in spans {
+        let ov = span.overlap_samples(start, end);
+        if ov == 0 {
+            continue;
+        }
+        best = Some(match best {
+            Some((_, prev)) if prev >= ov => best.unwrap(),
+            _ => (span.speaker_id, ov),
+        });
+    }
+    best.map(|(id, _)| id)
+}
+
+/// Run the diarizer over `samples` and return every speaker-attributed
+/// span in the chunk. Returns an empty vec when the diarizer chose not
+/// to embed (chunk too short, low confidence, …) or errored —
+/// diarization is *strictly* best-effort, so we never abort the
+/// pipeline because of it.
+///
+/// The returned spans may overlap when two speakers talk
+/// simultaneously; callers are expected to handle overlap by mapping
+/// individual Whisper segments to the dominant overlapping span,
+/// rather than collapsing the chunk to a single speaker.
+async fn assign_speaker_spans(
     diarizer: &mut dyn Diarizer,
     samples: &[Sample],
-    chunk_index: u32,
+    ctx: ChunkContext,
     session_id: StreamingSessionId,
-) -> Option<(SpeakerId, u32)> {
-    match diarizer.assign(samples).await {
-        Ok(Some(id)) => {
-            let slot = diarizer
-                .speakers()
-                .into_iter()
-                .find(|s| s.id == id)
-                .map(|s| s.slot)
-                .unwrap_or_else(|| {
-                    // Shouldn't happen — assign() just told us this id
-                    // exists. Log and fall back to slot 0 so the UI
-                    // still gets *some* colour.
-                    warn!(
-                        %session_id, chunk_index, %id,
-                        "diarizer returned id not present in speakers() snapshot"
-                    );
-                    0
-                });
-            Some((id, slot))
-        }
-        Ok(None) => None,
+) -> Vec<SpeakerSpan> {
+    match diarizer.assign_spans_at(samples, ctx).await {
+        Ok(spans) => spans,
         Err(e) => {
             warn!(
-                %session_id, chunk_index, error = %e,
+                %session_id, chunk_index = ctx.chunk_index, error = %e,
                 "diarizer failed; chunk will be unlabelled"
             );
-            None
+            Vec::new()
         }
     }
 }
@@ -647,6 +1100,13 @@ async fn assign_speaker(
 fn chunk_size_in_samples(format: AudioFormat, chunk_ms: u32) -> usize {
     let frames = (format.sample_rate_hz as u64 * u64::from(chunk_ms)) / 1_000;
     (frames as usize) * (format.channels as usize)
+}
+
+fn frames_to_ms(frames: u64, format: AudioFormat) -> u32 {
+    if format.sample_rate_hz == 0 {
+        return 0;
+    }
+    u32::try_from(frames * 1_000 / u64::from(format.sample_rate_hz)).unwrap_or(u32::MAX)
 }
 
 fn samples_to_ms(samples: usize, format: AudioFormat) -> u32 {

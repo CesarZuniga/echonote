@@ -1,0 +1,254 @@
+//! Latency and memory bench for the llama.cpp adapter, gated behind a real
+//! GGUF model on disk.
+//!
+//! It records evidence (printed with `--nocapture`), not pass/fail
+//! thresholds: the only assertions are sanity checks on the output.
+//!
+//! ```sh
+//! ECHO_LLM_MODEL="$HOME/Library/Application Support/app.echonote.desktop/models/llm/Qwen3-8B-Q4_K_M.gguf" \
+//!   cargo test -p echo-llm --test llama_bench -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! What is measured, with the default [`LoadOptions`] (8,192-token window):
+//!
+//! * **context cost** - a one-token completion of a tiny prompt, run twice.
+//!   The prompt evaluation is negligible, so the first call shows model
+//!   warm-up plus context creation and the second shows what a request
+//!   costs once any reusable state exists.
+//! * **prompt-eval throughput** - a ~6,000-token ChatML prompt, timed up to
+//!   the first visible streamed token, so decode of the answer is excluded
+//!   (only the few think-block steps of Qwen remain).
+//! * **chat turns** - the same long prompt with a 64-token greedy answer
+//!   (cold, then again with the whole prompt reusable), then a follow-up
+//!   turn carrying the first turn as history: time to first token, total
+//!   time and how many prompt tokens were reused from the KV cache.
+//! * **RSS** - resident set size of this process (via `ps`) before load,
+//!   after load, and after the first and later requests.
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use echo_domain::{
+    ChatAssistant, ChatMessage, ChatOptions, ChatRequest, GenerateOptions, LlmModel,
+};
+use echo_llm::{LlamaCppLlm, LoadOptions};
+use futures::StreamExt;
+
+const TARGET_PROMPT_TOKENS: usize = 6_000;
+
+/// Decode budget for the short requests. Qwen3 with `/no_think` first emits
+/// an empty `<think>\n\n</think>\n\n` block (about 6 tokens), so a budget
+/// of 1 would end before any visible text; 16 leaves room for it plus an
+/// answer word.
+const SHORT_REPLY_TOKENS: u32 = 16;
+
+fn model_from_env() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var("ECHO_LLM_MODEL").ok()?);
+    if path.exists() {
+        Some(path)
+    } else {
+        eprintln!("ECHO_LLM_MODEL points to {path:?} but it does not exist");
+        None
+    }
+}
+
+/// Resident set size of this process in MiB, or `None` when `ps` is
+/// unavailable or its output is not a number.
+fn rss_mib() -> Option<f64> {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    let kib: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(kib / 1024.0)
+}
+
+fn report_rss(label: &str) {
+    match rss_mib() {
+        Some(mib) => eprintln!("[bench] rss {label}: {mib:.0} MiB"),
+        None => eprintln!("[bench] rss {label}: unavailable"),
+    }
+}
+
+/// Synthetic Spanish meeting transcript of at least `target` tokens under
+/// the model's own tokenizer.
+fn synthetic_transcript(llm: &LlamaCppLlm, target: usize) -> String {
+    const LINES: [&str; 6] = [
+        "Ana: Revisé la planificación del trimestre y creo que deberíamos reorganizar las prioridades según la capacidad del equipo.",
+        "Luis: De acuerdo, pero antes necesitamos confirmar el presupuesto de infraestructura y la aprobación de la migración a producción.",
+        "Marta: El cliente pidió lanzar la versión nueva el lunes por la mañana; todavía falta cerrar las pruebas de regresión.",
+        "Pedro: Propongo dividir el trabajo en dos entregas y asignar a cada responsable una fecha límite concreta para la revisión.",
+        "Ana: Perfecto. Quedamos en que Luis envía el informe de costes el jueves y Marta coordina la ventana de despliegue.",
+        "Luis: Anotado. También conviene documentar los riesgos del proveedor externo y definir un plan de reversión antes del lanzamiento.",
+    ];
+    let mut text = String::new();
+    let mut i = 0_usize;
+    while llm.count_tokens(&text) < target {
+        text.push_str(&format!("[{:02}:{:02}] {}\n", i / 60, i % 60, LINES[i % 6]));
+        i += 1;
+    }
+    text
+}
+
+/// System + user conversation as chat messages: the adapter renders them
+/// with the loaded model's own template (ChatML for Qwen, Gemma's Jinja
+/// template for Gemma), so the bench measures the prompt a real request
+/// sends for either family.
+fn conversation(system: &str, user: &str) -> Vec<ChatMessage> {
+    vec![ChatMessage::system(system), ChatMessage::user(user)]
+}
+
+fn greedy(max_tokens: u32) -> GenerateOptions {
+    GenerateOptions {
+        max_tokens,
+        temperature: 0.0,
+        top_p: 1.0,
+        seed: Some(7),
+        stop: vec!["<|im_end|>".into()],
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ECHO_LLM_MODEL to point at a .gguf file"]
+async fn llama_latency_and_memory_baseline() {
+    let Some(model_path) = model_from_env() else {
+        eprintln!("skipping: ECHO_LLM_MODEL not set");
+        return;
+    };
+
+    report_rss("before load");
+    let started = Instant::now();
+    let llm = LlamaCppLlm::load_with(&model_path, LoadOptions::default().with_model_id("bench"))
+        .expect("load gguf");
+    eprintln!("[bench] model load: {} ms", started.elapsed().as_millis());
+    report_rss("after load");
+    eprintln!("[bench] context window: {}", llm.context_window());
+
+    // (a) context cost: tiny prompt, one token, twice.
+    eprintln!(
+        "[bench] family {}, rendering {}, {} special-token texts",
+        llm.prompt_format_name(),
+        llm.prompt_rendering_name(),
+        llm.special_token_count()
+    );
+    let tiny = conversation("Answer with one word.", "Say OK.");
+    for call in 1..=2 {
+        let started = Instant::now();
+        let out = llm
+            .generate_chat(&tiny, &greedy(SHORT_REPLY_TOKENS))
+            .await
+            .expect("tiny");
+        eprintln!(
+            "[bench] tiny request #{call} ({SHORT_REPLY_TOKENS} tokens max, tiny prompt): {} ms (output {out:?})",
+            started.elapsed().as_millis()
+        );
+        report_rss(&format!("after tiny request #{call}"));
+    }
+
+    // (b) prompt-eval throughput on a ~6k-token prompt.
+    let transcript = synthetic_transcript(&llm, TARGET_PROMPT_TOKENS);
+    let system = format!("You answer questions about this meeting transcript.\n\n{transcript}");
+    let question = "¿Qué se acordó sobre el informe de costes? Responde en una frase.";
+    let long = conversation(&system, question);
+    let (rendered, _) = llm.rendered_chat_prompt(&long);
+    let n_prompt = llm.count_tokens(&rendered);
+    eprintln!(
+        "[bench] prompt starts {:?}",
+        rendered.chars().take(40).collect::<String>()
+    );
+    // Prompt evaluation is timed as time-to-first-token of a streamed chat
+    // request: the first delta arrives only after the whole prompt has been
+    // evaluated, so decode steps (including Qwen's empty think block) stay out
+    // of the number.
+    let chat_probe = llm.chat_handle();
+    let probe = ChatRequest {
+        messages: long.clone(),
+        options: ChatOptions {
+            max_tokens: SHORT_REPLY_TOKENS,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: Some(7),
+            stop: vec!["<|im_end|>".into()],
+        },
+    };
+    let started = Instant::now();
+    let mut stream = chat_probe.ask(&probe).await.expect("long prompt");
+    let mut eval = None;
+    while let Some(item) = stream.next().await {
+        item.expect("stream item");
+        eval.get_or_insert_with(|| started.elapsed());
+    }
+    let eval = eval.expect("long prompt produced no visible token");
+    eprintln!(
+        "[bench] prompt eval: {n_prompt} tokens, time to first visible token {} ms = {:.1} tok/s (prompt eval only; for Qwen the first visible token follows the empty think block, a few decode steps)",
+        eval.as_millis(),
+        n_prompt as f64 / eval.as_secs_f64()
+    );
+    report_rss("after long-prompt request");
+
+    // (c) chat: turn 1, the same request again (maximum reuse) and a real
+    // follow-up turn that carries turn 1 and its answer as history.
+    let chat = llm.chat_handle();
+    // Step (b) left this very prompt in the KV cache; evict it with an
+    // unrelated request so turn 1 below is a true cold start.
+    let _ = llm
+        .generate_chat(&tiny, &greedy(SHORT_REPLY_TOKENS))
+        .await
+        .expect("evict");
+    let options = ChatOptions {
+        max_tokens: 64,
+        temperature: 0.0,
+        top_p: 1.0,
+        seed: Some(7),
+        stop: vec!["<|im_end|>".into()],
+    };
+    let mut first_answer = String::new();
+    for turn in 1..=3 {
+        let messages = if turn < 3 {
+            vec![
+                ChatMessage::system(system.clone()),
+                ChatMessage::user(question),
+            ]
+        } else {
+            vec![
+                ChatMessage::system(system.clone()),
+                ChatMessage::user(question),
+                ChatMessage::assistant(first_answer.clone()),
+                ChatMessage::user("¿Quién se encarga de ello? Responde en una frase."),
+            ]
+        };
+        let request = ChatRequest {
+            messages,
+            options: options.clone(),
+        };
+        let started = Instant::now();
+        let mut stream = chat.ask(&request).await.expect("ask");
+        let mut first: Option<Duration> = None;
+        let mut answer = String::new();
+        while let Some(item) = stream.next().await {
+            let token = item.expect("stream item");
+            first.get_or_insert_with(|| started.elapsed());
+            answer.push_str(&token.delta);
+        }
+        let total = started.elapsed();
+        let label = match turn {
+            1 => "turn 1 (cold)",
+            2 => "turn 2 (same prompt again)",
+            _ => "turn 3 (follow-up with history)",
+        };
+        eprintln!(
+            "[bench] chat {label}: first token {} ms, total {} ms, reused {} tokens, {} chars: {:?}",
+            first.map_or(0, |d| d.as_millis()),
+            total.as_millis(),
+            chat.last_reused_tokens(),
+            answer.len(),
+            answer.chars().take(80).collect::<String>()
+        );
+        assert!(!answer.trim().is_empty(), "chat turn #{turn} was empty");
+        if turn == 1 {
+            first_answer = answer;
+        }
+    }
+    report_rss("after chat turns");
+}

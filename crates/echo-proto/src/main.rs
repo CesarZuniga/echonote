@@ -22,9 +22,14 @@
 //!   (Wired Sprint 0 day 10.)
 //! - `bench wer` / `bench llm` — Phase 0 benchmarks.
 //!   (Wired Sprint 0 day 9-10.)
+//! - `bench der` — diarization error rate of the streaming diarizer over
+//!   `<wav> <rttm>` pairs (see [`bench_der`]).
 //!
 //! Every subcommand is a thin adapter that builds the relevant use case
 //! from `echo-app` and executes it.
+
+mod bench_der;
+mod embed_dump;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -146,6 +151,17 @@ enum Command {
         /// spot for streaming.
         #[arg(long, default_value_t = 5_000)]
         chunk_ms: u32,
+        /// Speech-aligned chunking (default with the Silero VAD):
+        /// shortest chunk cut at a speech pause, in milliseconds.
+        #[arg(long, default_value_t = StreamingOptions::default().min_chunk_ms)]
+        min_chunk_ms: u32,
+        /// Speech-aligned chunking: longest chunk, in milliseconds.
+        #[arg(long, default_value_t = StreamingOptions::default().max_chunk_ms)]
+        max_chunk_ms: u32,
+        /// Cut fixed `--chunk-ms` chunks even with the Silero VAD (the
+        /// pre-speech-aligned behaviour, e.g. for A/B benchmarks).
+        #[arg(long, default_value_t = false)]
+        fixed_chunks: bool,
         /// Skip transcription of chunks below this RMS. `0.0` disables
         /// the gate. Default 0.02 (~ -34 dBFS); raise it if room noise
         /// is sneaking past, lower it for very quiet speakers.
@@ -323,6 +339,121 @@ enum BenchKind {
         #[arg(long)]
         report: Option<PathBuf>,
     },
+    /// Diarization error rate (DER) benchmark.
+    ///
+    /// Runs every `<wav> <rttm>` pair of `--manifest` through the
+    /// streaming pipeline with the app's diarizer preset for the chosen
+    /// embedder (no ASR), applies the offline refinement merges, and
+    /// scores the speaker spans against the reference RTTM.
+    Der {
+        /// Manifest: one `<wav> <rttm>` pair per line, `#` comments,
+        /// paths relative to the manifest's directory.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Speaker embedder ONNX model.
+        #[arg(long, env = "ECHO_EMBED_MODEL")]
+        embedder: PathBuf,
+        /// Catalog id of the embedder (e.g. `embedder-campplus-multi`),
+        /// which selects its adapter and preset as the app does. Without
+        /// it the family is guessed from the file name: CAM++ names with
+        /// `zh_en`/`multi` are the multilingual CAM++, other `campplus`
+        /// names the EN CAM++, anything else ERes2Net.
+        #[arg(long)]
+        embedder_id: Option<String>,
+        /// Pyannote segmenter ONNX model (tract-patched export). Without
+        /// it each chunk is embedded whole.
+        #[arg(long)]
+        segmenter: Option<PathBuf>,
+        /// Override the preset online-cluster similarity threshold (a
+        /// cosine similarity in -1..=1).
+        #[arg(long, value_parser = bench_der::parse_cosine_threshold)]
+        threshold: Option<f32>,
+        /// Override the preset online speaker cap (at least 1).
+        #[arg(long, value_parser = bench_der::parse_max_speakers)]
+        max_speakers: Option<usize>,
+        /// Override the preset merge-only refinement threshold (a cosine
+        /// similarity in -1..=1 between raw embeddings). The
+        /// re-segmentation cut lives in the PLDA's LDA space and is set
+        /// with `--vbx init=...`.
+        #[arg(long, value_parser = bench_der::parse_cosine_threshold)]
+        refine_threshold: Option<f32>,
+        /// Skip the end-of-session offline refinement pass (same as
+        /// `--refine-mode off`).
+        #[arg(long, default_value_t = false, conflicts_with = "refine_mode")]
+        no_refine: bool,
+        /// End-of-session refinement: `off`, `merge-only` or `resegment`
+        /// (default: the embedder preset).
+        #[arg(long, value_parser = bench_der::parse_refine_mode)]
+        refine_mode: Option<echo_diarize::OfflineRefineMode>,
+        /// Override the preset VBx settings of the re-segmentation:
+        /// comma-separated `fa=`, `fb=`, `loop=`, `init=` (`cal:<offset>`
+        /// or a fixed cosine cut, both in the PLDA's LDA space), `lda=`,
+        /// `smooth=`, `maxspk=`, `iters=`.
+        #[arg(long)]
+        vbx: Option<String>,
+        /// Also embed 1.5 s windows inside spans longer than 3 s for the
+        /// re-segmentation (off in the app; comparison only).
+        #[arg(long, default_value_t = false)]
+        dense_windows: bool,
+        /// PLDA model file (`scripts/fit-plda.py`) replacing the bundled
+        /// one of the embedder family.
+        #[arg(long)]
+        plda: Option<PathBuf>,
+        /// File with one VBx spec per line (same syntax as `--vbx`); each
+        /// re-segments every session at stop and gets its own pooled
+        /// score (calibration).
+        #[arg(long)]
+        vbx_grid: Option<PathBuf>,
+        /// Silero VAD model for speech-aligned chunks.
+        #[arg(long, env = "ECHO_VAD_MODEL")]
+        vad: Option<PathBuf>,
+        /// Run fixed `--chunk-ms` chunks behind the RMS gate instead of
+        /// the VAD.
+        #[arg(long, default_value_t = false)]
+        no_neural_vad: bool,
+        /// Minimum speech-aligned chunk length.
+        #[arg(long, default_value_t = StreamingOptions::default().min_chunk_ms)]
+        min_chunk_ms: u32,
+        /// Maximum speech-aligned chunk length.
+        #[arg(long, default_value_t = StreamingOptions::default().max_chunk_ms)]
+        max_chunk_ms: u32,
+        /// Fixed chunk length when the neural VAD is off.
+        #[arg(long, default_value_t = StreamingOptions::default().chunk_ms)]
+        chunk_ms: u32,
+        /// Seconds excluded on each side of every reference boundary.
+        #[arg(long, default_value_t = 0.25)]
+        collar: f64,
+        /// Exclude reference overlap regions from scoring.
+        #[arg(long, default_value_t = false)]
+        skip_overlap: bool,
+        /// Write one hypothesis RTTM per recording into this directory.
+        #[arg(long)]
+        hyp_dir: Option<PathBuf>,
+        /// Print the report as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Dump speaker embeddings of a list of wav files to one binary file
+    /// (offline PLDA fitting; see `scripts/fit-plda.py`).
+    ///
+    /// Developer tooling for public corpora: each `<wav> <label>` line of
+    /// `--list` (mono, at the embedder's rate) is embedded whole with the
+    /// app's adapter for the embedder family.
+    EmbedDump {
+        /// List: one `<wav> <label>` pair per line, `#` comments, paths
+        /// relative to the list's directory.
+        #[arg(long)]
+        list: PathBuf,
+        /// Speaker embedder ONNX model.
+        #[arg(long, env = "ECHO_EMBED_MODEL")]
+        embedder: PathBuf,
+        /// Catalog id of the embedder (e.g. `embedder-campplus-multi`).
+        #[arg(long)]
+        embedder_id: Option<String>,
+        /// Output file; labels go to `<out>.labels.txt`.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// LLM summary benchmark over gold transcripts.
     ///
     /// Scaffolding only — wires the contract (input set, prompt
@@ -364,6 +495,9 @@ async fn main() -> Result<()> {
             device,
             language,
             chunk_ms,
+            min_chunk_ms,
+            max_chunk_ms,
+            fixed_chunks,
             silence_threshold,
             diarize,
             embed_model,
@@ -376,7 +510,12 @@ async fn main() -> Result<()> {
                 source,
                 device,
                 language,
-                chunk_ms,
+                ChunkArgs {
+                    chunk_ms,
+                    min_chunk_ms,
+                    max_chunk_ms,
+                    fixed_chunks,
+                },
                 silence_threshold,
                 diarize,
                 embed_model,
@@ -406,6 +545,75 @@ async fn main() -> Result<()> {
                 max_wer,
                 report,
             } => run_bench_wer(fixtures, model, language, max_wer, report).await,
+            BenchKind::Der {
+                manifest,
+                embedder,
+                embedder_id,
+                segmenter,
+                threshold,
+                max_speakers,
+                refine_threshold,
+                no_refine,
+                refine_mode,
+                vbx,
+                dense_windows,
+                plda,
+                vbx_grid,
+                vad,
+                no_neural_vad,
+                min_chunk_ms,
+                max_chunk_ms,
+                chunk_ms,
+                collar,
+                skip_overlap,
+                hyp_dir,
+                json,
+            } => {
+                if !no_neural_vad && vad.is_none() {
+                    anyhow::bail!(
+                        "bench der needs --vad (or ECHO_VAD_MODEL) for speech-aligned chunks; \
+                         pass --no-neural-vad for fixed chunks"
+                    );
+                }
+                bench_der::run(bench_der::DerArgs {
+                    manifest,
+                    embedder,
+                    embedder_id,
+                    segmenter,
+                    threshold,
+                    max_speakers,
+                    refine_threshold,
+                    refine_mode: if no_refine {
+                        Some(echo_diarize::OfflineRefineMode::Off)
+                    } else {
+                        refine_mode
+                    },
+                    vbx,
+                    dense_windows,
+                    plda,
+                    vbx_grid,
+                    vad: vad.filter(|_| !no_neural_vad),
+                    min_chunk_ms,
+                    max_chunk_ms,
+                    chunk_ms,
+                    collar,
+                    skip_overlap,
+                    hyp_dir,
+                    json,
+                })
+                .await
+            }
+            BenchKind::EmbedDump {
+                list,
+                embedder,
+                embedder_id,
+                out,
+            } => embed_dump::run(&embed_dump::EmbedDumpArgs {
+                list,
+                embedder,
+                embedder_id,
+                out,
+            }),
             BenchKind::Llm { fixtures, model } => run_bench_llm(fixtures, model).await,
         },
         Command::Meetings { kind } => run_meetings(kind).await,
@@ -582,6 +790,14 @@ async fn run_transcribe(
 // `stream` subcommand
 // ---------------------------------------------------------------------------
 
+/// Chunking flags of the `stream` subcommand.
+struct ChunkArgs {
+    chunk_ms: u32,
+    min_chunk_ms: u32,
+    max_chunk_ms: u32,
+    fixed_chunks: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_stream(
     duration_secs: u64,
@@ -589,7 +805,7 @@ async fn run_stream(
     source_arg: SourceArg,
     device: Option<String>,
     language: Option<String>,
-    chunk_ms: u32,
+    chunks: ChunkArgs,
     silence_threshold: f32,
     diarize: bool,
     embed_model: Option<PathBuf>,
@@ -620,9 +836,9 @@ async fn run_stream(
     // by named device. Surfacing `--device` for it would be misleading.
     let device_id = match source {
         AudioSource::Microphone => device,
-        AudioSource::SystemOutput => {
+        AudioSource::SystemOutput | AudioSource::Mixed => {
             if device.is_some() {
-                tracing::warn!("--device is ignored when --source system-output");
+                tracing::warn!("--device is ignored when --source system-output/mixed");
             }
             None
         }
@@ -633,10 +849,14 @@ async fn run_stream(
         device_id,
         preferred_format: AudioFormat::WHISPER,
     };
+    let chunk_ms = chunks.chunk_ms;
     let options = StreamingOptions {
         language,
         chunk_ms,
         silence_rms_threshold: silence_threshold,
+        speech_aligned_chunks: !chunks.fixed_chunks,
+        min_chunk_ms: chunks.min_chunk_ms,
+        max_chunk_ms: chunks.max_chunk_ms,
     };
 
     let store: Arc<dyn MeetingStore> = Arc::new(open_cli_store().await?);
@@ -702,17 +922,25 @@ async fn run_stream(
         }
     };
 
+    let chunking = if vad_active && options.speech_aligned_chunks {
+        format!(
+            "{}-{} ms speech-aligned chunks",
+            options.min_chunk_ms, options.max_chunk_ms
+        )
+    } else {
+        format!("{chunk_ms} ms chunks")
+    };
     let mut handle = pipeline
         .start_with_spec(spec, options)
         .await
         .context("failed to start streaming pipeline")?;
 
     println!(
-        "▶ streaming session {} — source={:?} — {}s window {}ms — diarize={} — vad={} — Ctrl-C or wait to stop",
+        "▶ streaming session {} — source={:?} — {}s window {} — diarize={} — vad={} — Ctrl-C or wait to stop",
         handle.session_id(),
         source,
         duration_secs,
-        chunk_ms,
+        chunking,
         diarize,
         if vad_active { "silero" } else { "rms" },
     );
@@ -819,6 +1047,18 @@ async fn run_stream(
             }
             Some(TranscriptEvent::Resumed { .. }) => {
                 println!("  ▸ resumed");
+            }
+            Some(TranscriptEvent::SpeakersMerged { merges, .. }) => {
+                println!("  ⤳ offline refine merged {} speaker(s)", merges.len());
+            }
+            Some(TranscriptEvent::SpeakersReassigned {
+                segments, retired, ..
+            }) => {
+                println!(
+                    "  ⤳ offline refine moved {} segment(s), retired {} speaker(s)",
+                    segments.len(),
+                    retired.len()
+                );
             }
             None => break,
         }
@@ -947,6 +1187,7 @@ async fn run_summarize(
             SummarizeMeetingError::InvalidTemplate(t) => {
                 anyhow::anyhow!("invalid template: {t}")
             }
+            SummarizeMeetingError::ContextTooSmall(msg) => anyhow::anyhow!("llm context: {msg}"),
             SummarizeMeetingError::Llm(err) => anyhow::anyhow!("llm: {err}"),
             SummarizeMeetingError::Storage(err) => anyhow::anyhow!("storage: {err}"),
         })?;
@@ -1475,4 +1716,42 @@ fn load_wav_as_pcm(path: &Path) -> Result<(Vec<f32>, AudioFormat)> {
         channels: spec.channels,
     };
     Ok((samples, format))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bench_der(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let base = [
+            "echo-proto",
+            "bench",
+            "der",
+            "--manifest",
+            "m.txt",
+            "--embedder",
+            "e.onnx",
+        ];
+        Cli::try_parse_from(base.iter().chain(extra))
+    }
+
+    #[test]
+    fn no_refine_and_refine_mode_conflict() {
+        let err = bench_der(&["--no-refine", "--refine-mode", "resegment"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(bench_der(&["--no-refine"]).is_ok());
+        assert!(bench_der(&["--refine-mode", "off"]).is_ok());
+    }
+
+    #[test]
+    fn online_threshold_must_be_a_finite_cosine() {
+        // `--flag=value` so clap does not read a negative value as a flag.
+        for ok in ["-1", "0.45", "1"] {
+            assert!(bench_der(&[&format!("--threshold={ok}")]).is_ok(), "{ok}");
+        }
+        for bad in ["NaN", "inf", "1.01", "-1.5", "x"] {
+            let err = bench_der(&[&format!("--threshold={bad}")]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+        }
+    }
 }

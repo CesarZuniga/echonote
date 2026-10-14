@@ -30,9 +30,13 @@ use time::OffsetDateTime;
 use tracing::{debug, warn};
 
 use echo_domain::{
-    CreateMeeting, DomainError, FinalizeMeeting, MeetingId, MeetingStore, Speaker,
-    StreamingSessionId, TranscriptEvent,
+    CreateMeeting, DomainError, FinalizeMeeting, MeetingId, MeetingStore, Speaker, SpeakerId,
+    SpeakerReassignment, SpeakerRef, StreamingSessionId, TranscriptEvent,
 };
+
+/// Pause before the single retry of a `reassign_speakers` call that
+/// failed with a storage error (a transient lock, for instance).
+const REASSIGN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Stateful recorder. One instance per session is the simplest pattern,
 /// but the type also handles multiple interleaved sessions safely
@@ -127,26 +131,43 @@ impl MeetingRecorder {
                 language,
                 speaker_id,
                 speaker_slot,
+                speakers,
                 ..
             } => {
                 let meeting_id = self
                     .update_chunk_stats(session_id, segments, language)
                     .await;
                 if let Some(meeting_id) = meeting_id {
-                    // Persist the speaker BEFORE the segments so the
-                    // `segments.speaker_id` foreign key always finds
-                    // its row, even on the very first chunk for this
-                    // slot. Anonymous (label = None) — the rename use
-                    // case populates the label later, and the COALESCE
-                    // upsert keeps it from being clobbered by the next
-                    // recorder pass.
-                    if let (Some(sid), Some(slot)) = (speaker_id, speaker_slot) {
+                    // Persist EVERY speaker the chunk references BEFORE
+                    // its segments: `segments.speaker_id` is a foreign
+                    // key to `speakers(id)` and each segment may belong
+                    // to a different speaker than the chunk-dominant one,
+                    // so upserting only the dominant pair would make the
+                    // whole `append_segments` batch fail. The dominant
+                    // pair is also upserted for producers that predate
+                    // `speakers`. Anonymous (label = None) — the rename
+                    // use case populates the label later, and the
+                    // COALESCE upsert keeps it from being clobbered by
+                    // the next recorder pass.
+                    let dominant = match (speaker_id, speaker_slot) {
+                        (Some(id), Some(slot)) => Some(SpeakerRef {
+                            id: *id,
+                            slot: *slot,
+                        }),
+                        _ => None,
+                    };
+                    let mut seen: Vec<SpeakerId> = Vec::new();
+                    for r in speakers.iter().copied().chain(dominant) {
+                        if seen.contains(&r.id) {
+                            continue;
+                        }
+                        seen.push(r.id);
                         self.store
                             .upsert_speaker(
                                 meeting_id,
                                 &Speaker {
-                                    id: *sid,
-                                    slot: *slot,
+                                    id: r.id,
+                                    slot: r.slot,
                                     label: None,
                                 },
                             )
@@ -243,6 +264,95 @@ impl MeetingRecorder {
                     Ok(None)
                 }
             }
+            TranscriptEvent::SpeakersMerged { session_id, merges } => {
+                let meeting_id = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(session_id)
+                    .map(|s| s.meeting_id);
+                let Some(meeting_id) = meeting_id else {
+                    warn!(%session_id, "recorder: speakers-merged for unknown session");
+                    return Ok(None);
+                };
+                for m in merges {
+                    if m.absorbed == m.surviving {
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .store
+                        .merge_speakers(meeting_id, m.absorbed, m.surviving)
+                        .await
+                    {
+                        // Best-effort: a single merge failing shouldn't
+                        // abort the session's finalisation. Surface in
+                        // logs so the operator can see the DB is stale.
+                        warn!(
+                            %session_id, %meeting_id,
+                            absorbed = %m.absorbed, surviving = %m.surviving, error = %e,
+                            "recorder: merge_speakers failed"
+                        );
+                    }
+                }
+                debug!(
+                    %session_id, %meeting_id, merges = merges.len(),
+                    "recorder: offline diarization merges applied"
+                );
+                Ok(Some(meeting_id))
+            }
+            TranscriptEvent::SpeakersReassigned {
+                session_id,
+                plan_id,
+                created,
+                retired,
+                segments,
+                ..
+            } => {
+                let meeting_id = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(session_id)
+                    .map(|s| s.meeting_id);
+                let Some(meeting_id) = meeting_id else {
+                    warn!(%session_id, %plan_id, "recorder: speakers-reassigned for unknown session");
+                    return Ok(None);
+                };
+                let plan = SpeakerReassignment {
+                    created: created.clone(),
+                    retired: retired.clone(),
+                    segments: segments.clone(),
+                };
+                // One all-or-nothing call: on failure the store rolled
+                // back and the online attribution stays persisted, so the
+                // session still finalises normally. A storage error (for
+                // example SQLite busy) gets one retry after a short pause;
+                // an invalid plan does not.
+                let mut result = self.store.reassign_speakers(meeting_id, &plan).await;
+                if let Err(e @ DomainError::Storage(_)) = &result {
+                    warn!(
+                        %session_id, %meeting_id, %plan_id, error = %e,
+                        "recorder: reassign_speakers failed; retrying once"
+                    );
+                    tokio::time::sleep(REASSIGN_RETRY_BACKOFF).await;
+                    result = self.store.reassign_speakers(meeting_id, &plan).await;
+                }
+                match result {
+                    Ok(out) => debug!(
+                        %session_id, %meeting_id, %plan_id,
+                        segments = out.segments_updated,
+                        created = out.speakers_created,
+                        deleted = out.speakers_deleted,
+                        labels_moved = out.labels_moved,
+                        "recorder: speaker reassignment applied"
+                    ),
+                    Err(e) => warn!(
+                        %session_id, %meeting_id, %plan_id, error = %e,
+                        "recorder: reassign_speakers failed; online attribution kept"
+                    ),
+                }
+                Ok(Some(meeting_id))
+            }
             // Paused / Resumed are informational UI events — the
             // recorder doesn't persist anything for them.
             TranscriptEvent::Paused { .. } | TranscriptEvent::Resumed { .. } => Ok(None),
@@ -288,6 +398,13 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         meetings: Mutex<Vec<Meeting>>,
+        /// Every plan passed to `reassign_speakers`.
+        reassignments: Mutex<Vec<(MeetingId, echo_domain::SpeakerReassignment)>>,
+        /// Errors `reassign_speakers` returns, in order, before it
+        /// succeeds (rollback simulation).
+        reassign_failures: Mutex<std::collections::VecDeque<DomainError>>,
+        /// Calls to `reassign_speakers`, failed ones included.
+        reassign_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeStore {
@@ -330,6 +447,18 @@ mod tests {
                     entity: "meeting",
                     id: meeting_id.to_string(),
                 })?;
+            // Mirror SQLite's `segments.speaker_id REFERENCES speakers(id)`
+            // with `foreign_keys = ON`: the whole batch is rejected when a
+            // segment names a speaker that was never upserted.
+            if let Some(missing) = segments
+                .iter()
+                .filter_map(|s| s.speaker_id)
+                .find(|id| !m.speakers.iter().any(|sp| sp.id == *id))
+            {
+                return Err(DomainError::Invariant(format!(
+                    "FOREIGN KEY constraint failed: speaker {missing} not upserted"
+                )));
+            }
             for s in segments {
                 if !m.segments.iter().any(|x| x.id == s.id) {
                     m.segments.push(s.clone());
@@ -378,6 +507,49 @@ mod tests {
             };
             s.label = label.map(|l| l.to_string());
             Ok(true)
+        }
+        async fn merge_speakers(
+            &self,
+            meeting_id: MeetingId,
+            absorbed: SpeakerId,
+            surviving: SpeakerId,
+        ) -> Result<bool, DomainError> {
+            let mut guard = self.meetings.lock().unwrap();
+            let Some(m) = guard.iter_mut().find(|m| m.summary.id == meeting_id) else {
+                return Ok(false);
+            };
+            if !m.speakers.iter().any(|s| s.id == surviving) {
+                return Ok(false);
+            }
+            let mut changed = false;
+            for seg in &mut m.segments {
+                if seg.speaker_id == Some(absorbed) {
+                    seg.speaker_id = Some(surviving);
+                    changed = true;
+                }
+            }
+            let before = m.speakers.len();
+            m.speakers.retain(|s| s.id != absorbed);
+            if m.speakers.len() != before {
+                changed = true;
+            }
+            Ok(changed)
+        }
+        async fn reassign_speakers(
+            &self,
+            meeting_id: MeetingId,
+            plan: &echo_domain::SpeakerReassignment,
+        ) -> Result<echo_domain::ReassignOutcome, DomainError> {
+            self.reassign_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(e) = self.reassign_failures.lock().unwrap().pop_front() {
+                return Err(e);
+            }
+            self.reassignments
+                .lock()
+                .unwrap()
+                .push((meeting_id, plan.clone()));
+            Ok(echo_domain::ReassignOutcome::default())
         }
         async fn list_speakers(&self, meeting_id: MeetingId) -> Result<Vec<Speaker>, DomainError> {
             let guard = self.meetings.lock().unwrap();
@@ -518,6 +690,7 @@ mod tests {
                 rtf: 0.1,
                 speaker_id: None,
                 speaker_slot: None,
+                speakers: vec![],
             })
             .await
             .unwrap();
@@ -531,6 +704,7 @@ mod tests {
                 rtf: 0.1,
                 speaker_id: None,
                 speaker_slot: None,
+                speakers: vec![],
             })
             .await
             .unwrap();
@@ -578,6 +752,7 @@ mod tests {
                     rtf: 0.1,
                     speaker_id: None,
                     speaker_slot: None,
+                    speakers: vec![],
                 })
                 .await
                 .unwrap();
@@ -632,6 +807,7 @@ mod tests {
                     rtf: 0.1,
                     speaker_id: Some(sid),
                     speaker_slot: Some(slot),
+                    speakers: vec![SpeakerRef { id: sid, slot }],
                 })
                 .await
                 .unwrap();
@@ -673,10 +849,195 @@ mod tests {
                 rtf: 0.0,
                 speaker_id: None,
                 speaker_slot: None,
+                speakers: vec![],
             })
             .await
             .unwrap();
         assert_eq!(result, None);
         assert!(store.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn segments_referencing_non_dominant_speakers_are_persisted() {
+        let store = Arc::new(FakeStore::default());
+        let recorder = MeetingRecorder::with_default_title(store.clone());
+        let session = StreamingSessionId::new();
+        recorder
+            .record(&TranscriptEvent::Started {
+                session_id: session,
+                input_format: AudioFormat::WHISPER,
+            })
+            .await
+            .unwrap();
+
+        let alice = SpeakerId::new();
+        let bob = SpeakerId::new();
+        let mut first = segment(0, 1_000, "a");
+        first.speaker_id = Some(alice);
+        let mut second = segment(1_000, 2_000, "b");
+        second.speaker_id = Some(bob);
+
+        // Chunk-dominant speaker is Alice, but the second segment
+        // belongs to Bob: both rows must exist before the segments.
+        recorder
+            .record(&TranscriptEvent::Chunk {
+                session_id: session,
+                chunk_index: 0,
+                offset_ms: 0,
+                segments: vec![first, second],
+                language: Some("en".into()),
+                rtf: 0.1,
+                speaker_id: Some(alice),
+                speaker_slot: Some(0),
+                speakers: vec![
+                    SpeakerRef { id: alice, slot: 0 },
+                    SpeakerRef { id: bob, slot: 1 },
+                ],
+            })
+            .await
+            .expect("every referenced speaker must be upserted before append_segments");
+
+        let snap = store.snapshot();
+        assert_eq!(snap[0].segments.len(), 2);
+        assert!(snap[0]
+            .speakers
+            .iter()
+            .any(|s| s.id == alice && s.slot == 0));
+        assert!(snap[0].speakers.iter().any(|s| s.id == bob && s.slot == 1));
+    }
+    fn reassigned(session_id: StreamingSessionId) -> TranscriptEvent {
+        let speaker = SpeakerId::new();
+        TranscriptEvent::SpeakersReassigned {
+            session_id,
+            plan_id: uuid::Uuid::now_v7(),
+            created: vec![SpeakerRef {
+                id: speaker,
+                slot: 3,
+            }],
+            retired: vec![echo_domain::SpeakerRetirement {
+                speaker: SpeakerId::new(),
+                majority_recipient: Some(speaker),
+            }],
+            segments: vec![echo_domain::SegmentSpeaker {
+                segment_id: SegmentId::new(),
+                speaker_id: Some(speaker),
+            }],
+            chunks: vec![],
+        }
+    }
+
+    async fn started(recorder: &MeetingRecorder) -> (StreamingSessionId, MeetingId) {
+        let session = StreamingSessionId::new();
+        let meeting = recorder
+            .record(&TranscriptEvent::Started {
+                session_id: session,
+                input_format: AudioFormat::WHISPER,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        (session, meeting)
+    }
+
+    #[tokio::test]
+    async fn speakers_reassigned_is_applied_in_one_store_call() {
+        let store = Arc::new(FakeStore::default());
+        let recorder = MeetingRecorder::with_default_title(store.clone());
+        let (session, meeting) = started(&recorder).await;
+        let event = reassigned(session);
+
+        let out = recorder.record(&event).await.unwrap();
+
+        assert_eq!(out, Some(meeting));
+        let TranscriptEvent::SpeakersReassigned {
+            created,
+            retired,
+            segments,
+            ..
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            *store.reassignments.lock().unwrap(),
+            vec![(
+                meeting,
+                echo_domain::SpeakerReassignment {
+                    created,
+                    retired,
+                    segments,
+                }
+            )]
+        );
+    }
+
+    fn failing_store(errors: Vec<DomainError>) -> Arc<FakeStore> {
+        Arc::new(FakeStore {
+            reassign_failures: Mutex::new(errors.into()),
+            ..FakeStore::default()
+        })
+    }
+
+    fn reassign_calls(store: &FakeStore) -> usize {
+        store
+            .reassign_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn speakers_reassigned_for_an_unknown_session_is_ignored() {
+        let store = Arc::new(FakeStore::default());
+        let recorder = MeetingRecorder::with_default_title(store.clone());
+        let out = recorder
+            .record(&reassigned(StreamingSessionId::new()))
+            .await
+            .unwrap();
+        assert_eq!(out, None);
+        assert_eq!(reassign_calls(&store), 0);
+    }
+
+    #[tokio::test]
+    async fn a_transient_store_failure_is_retried_once() {
+        let store = failing_store(vec![DomainError::Storage("database is locked".into())]);
+        let recorder = MeetingRecorder::with_default_title(store.clone());
+        let (session, meeting) = started(&recorder).await;
+        let out = recorder.record(&reassigned(session)).await.unwrap();
+        assert_eq!(out, Some(meeting));
+        assert_eq!(reassign_calls(&store), 2);
+        assert_eq!(store.reassignments.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_plan_is_not_retried() {
+        let store = failing_store(vec![DomainError::Invariant("foreign id".into())]);
+        let recorder = MeetingRecorder::with_default_title(store.clone());
+        let (session, _) = started(&recorder).await;
+        recorder.record(&reassigned(session)).await.unwrap();
+        assert_eq!(reassign_calls(&store), 1);
+        assert!(store.reassignments.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_reassignment_keeps_the_session_finalisable() {
+        let store = failing_store(vec![
+            DomainError::Storage("injected".into()),
+            DomainError::Storage("injected".into()),
+        ]);
+        let recorder = MeetingRecorder::with_default_title(store.clone());
+        let (session, meeting) = started(&recorder).await;
+
+        let out = recorder.record(&reassigned(session)).await;
+        assert_eq!(out.unwrap(), Some(meeting), "failure is logged, not raised");
+        assert_eq!(reassign_calls(&store), 2, "one bounded retry");
+
+        recorder
+            .record(&TranscriptEvent::Stopped {
+                session_id: session,
+                total_segments: 0,
+                total_audio_ms: 1_000,
+            })
+            .await
+            .unwrap();
+        assert!(store.snapshot()[0].summary.ended_at.is_some());
     }
 }

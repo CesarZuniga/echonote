@@ -1,0 +1,43 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+	"vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
+	"files": {
+		"includes": [
+			"src/**",
+			"!src/ipc/bindings.ts",
+			"!**/dist",
+			"!**/node_modules"
+		]
+	},
+	"formatter": { "enabled": false },
+	"assist": { "enabled": false },
+	"css": { "parser": { "tailwindDirectives": true } },
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"correctness": {
+				// Downgraded: fixing needs per-hook review (risk of changing effect timing).
+				"useExhaustiveDependencies": "warn"
+			},
+			"suspicious": {
+				// Downgraded: index keys are used on static/append-only lists; fix needs stable ids.
+				"noArrayIndexKey": "warn"
+			},
+			"security": {
+				// Not in the recommended set; enforced explicitly. The one use (SearchResults)
+				// carries an inline suppression documenting the server-side escaping.
+				"noDangerouslySetInnerHtml": "error"
+			},
+			"a11y": {
+				// Downgraded: accessibility rework of Modal/ContextMenu/ResizableHandle/autofocus is
+				// a UI change, out of scope for the lint rollout.
+				"noStaticElementInteractions": "warn",
+				"useKeyWithClickEvents": "warn",
+				"useSemanticElements": "warn",
+				"noAutofocus": "warn",
+				// Off: the SVGs in src/assets are decorative logo files, not inline UI.
+				"noSvgWithoutTitle": "off"
+			}
+		}
+	}
+}

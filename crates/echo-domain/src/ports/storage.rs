@@ -16,6 +16,7 @@ use crate::entities::meeting::{Meeting, MeetingId, MeetingSearchHit, MeetingSumm
 use crate::entities::note::Note;
 use crate::entities::segment::Segment;
 use crate::entities::speaker::{Speaker, SpeakerId};
+use crate::entities::streaming::{SegmentSpeaker, SpeakerRef, SpeakerRetirement};
 use crate::entities::summary::Summary;
 use crate::ports::audio::AudioFormat;
 use crate::DomainError;
@@ -45,6 +46,32 @@ pub struct FinalizeMeeting {
     pub language: Option<String>,
     /// New segment count after the final flush, if it changed.
     pub segment_count: Option<u32>,
+}
+
+/// Speaker changes from one offline re-segmentation, applied by
+/// [`MeetingStore::reassign_speakers`]. Same shapes as
+/// `TranscriptEvent::SpeakersReassigned`; ids only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeakerReassignment {
+    /// Speakers to insert (unlabelled) before any segment points at them.
+    pub created: Vec<SpeakerRef>,
+    /// Speakers left without segments, with their majority recipient.
+    pub retired: Vec<SpeakerRetirement>,
+    /// Segments to point at a new speaker.
+    pub segments: Vec<SegmentSpeaker>,
+}
+
+/// What [`MeetingStore::reassign_speakers`] changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReassignOutcome {
+    /// Segments whose speaker actually changed.
+    pub segments_updated: u32,
+    /// Speaker rows inserted (0 on replay).
+    pub speakers_created: u32,
+    /// Retired speaker rows deleted.
+    pub speakers_deleted: u32,
+    /// User labels handed to a majority recipient.
+    pub labels_moved: u32,
 }
 
 /// Persistence port for meetings + their segments.
@@ -102,6 +129,53 @@ pub trait MeetingStore: Send + Sync {
         speaker_id: SpeakerId,
         label: Option<&str>,
     ) -> Result<bool, DomainError>;
+
+    /// Collapse one speaker into another for this meeting.
+    ///
+    /// Rewrites every `segments.speaker_id` referencing `absorbed` to
+    /// `surviving`, then retires the `absorbed` row without ever losing a
+    /// user label (ADR 0001, Q1): an unlabelled row is deleted; a labelled
+    /// row hands its label to `surviving` when that row has none, and is
+    /// otherwise kept with zero segments. Such a labelled, segment-less
+    /// row stays in [`MeetingStore::list_speakers`] and in the meeting's
+    /// speakers, so consumers must tolerate a speaker that owns no
+    /// segment (the desktop speakers panel shows it at 0 % talk time,
+    /// where it can still be renamed). Used by the
+    /// offline diarization refinement pass invoked at the end of a
+    /// streaming session to fix online over-splits.
+    ///
+    /// Idempotent: if `absorbed` no longer exists the call succeeds
+    /// with `Ok(false)`. Returns `Ok(true)` when at least one
+    /// speaker or segment row was modified. If `surviving` does not
+    /// exist the call is a no-op (returns `Ok(false)`) — callers
+    /// should keep both ids in sync with the diarizer's view of the
+    /// meeting.
+    async fn merge_speakers(
+        &self,
+        meeting_id: MeetingId,
+        absorbed: SpeakerId,
+        surviving: SpeakerId,
+    ) -> Result<bool, DomainError>;
+
+    /// Apply an offline re-segmentation in one all-or-nothing
+    /// transaction (ADR 0001, D5).
+    ///
+    /// In order: insert `created` speakers (replay-safe), point every
+    /// listed segment at its new speaker, then retire each `retired`
+    /// speaker that has no segment left, under the same label rule as
+    /// [`MeetingStore::merge_speakers`]: a user label is never
+    /// overwritten or destroyed.
+    ///
+    /// Returns [`DomainError::NotFound`] when the meeting does not
+    /// exist and [`DomainError::Invariant`] when a listed segment, a
+    /// referenced speaker, a retired speaker or a created speaker id
+    /// belongs to another meeting; nothing is written in either case.
+    /// Applying the same plan twice leaves the same state.
+    async fn reassign_speakers(
+        &self,
+        meeting_id: MeetingId,
+        plan: &SpeakerReassignment,
+    ) -> Result<ReassignOutcome, DomainError>;
 
     /// Update the display title of a meeting. Returns `false` when
     /// the meeting id was not found.

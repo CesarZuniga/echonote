@@ -1,11 +1,13 @@
 # -----------------------------------------------------------------------------
 # EchoNote — Continuous Integration
 # -----------------------------------------------------------------------------
-# Runs on every push and PR. Three parallel jobs:
+# Runs on every push and PR. Parallel jobs:
 #
 #   1. fmt       — rustfmt --check (fast, fails early)
 #   2. macos     — full pipeline: clippy + tests + build on Apple Silicon
 #   3. linux     — `cargo check` only, to catch platform-specific drift early
+#   4. audit     — cargo audit + pnpm audit
+#   5. cargo-deny — supply-chain policy (deny.toml): advisories, bans, licenses, sources
 #
 # Phase 0 runs macOS-only as the primary dev target. Linux and Windows get
 # full pipelines in Phase 1 (weeks 12-15).
@@ -79,7 +81,7 @@ jobs:
         shared-key: macos-14
 
     - name: Setup pnpm (version from packageManager field)
-      uses: pnpm/action-setup@8912a9102ac27614460f54aedde9e1e7f9aec20d # v6
+      uses: pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0 # v6.0.7
 
     - name: Setup Node
       uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
@@ -93,6 +95,9 @@ jobs:
 
     - name: pnpm typecheck
       run: pnpm typecheck
+
+    - name: pnpm lint (Biome, lint only)
+      run: pnpm lint
 
     - name: pnpm test (vitest)
       # The frontend now has reducer + hook tests under src/. They
@@ -169,7 +174,7 @@ jobs:
         shared-key: ubuntu-24.04
 
     - name: Setup pnpm (version from packageManager field)
-      uses: pnpm/action-setup@8912a9102ac27614460f54aedde9e1e7f9aec20d # v6
+      uses: pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0 # v6.0.7
 
     - name: Setup Node
       uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
@@ -213,7 +218,7 @@ jobs:
         cargo audit
 
     - name: Setup pnpm (version from packageManager field)
-      uses: pnpm/action-setup@8912a9102ac27614460f54aedde9e1e7f9aec20d # v6
+      uses: pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0 # v6.0.7
 
     - name: Setup Node
       uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
@@ -227,3 +232,29 @@ jobs:
 
     - name: pnpm audit
       run: pnpm audit --prod || true
+
+  # ---------------------------------------------------------------------------
+  # cargo-deny — supply-chain policy from deny.toml (advisories, bans,
+  # licenses, sources). Runs on its own; does not need a build.
+  # ---------------------------------------------------------------------------
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: cargo deny check
+      uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      env:
+        # .cargo/config.toml routes rustc through sccache, which the action
+        # container lacks; cargo-deny only reads metadata, so drop the wrapper.
+        RUSTC_WRAPPER: ""
+      with:
+        # The action image ships an older Rust; rust-toolchain.toml pins 1.99.0,
+        # so cargo metadata fails unless the container installs that version.
+        rust-version: "1.99.0"
+        command: check advisories bans licenses sources
