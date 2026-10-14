@@ -208,8 +208,10 @@ pub(crate) async fn run(args: DerArgs) -> Result<()> {
         cluster.max_speakers = max_speakers;
     }
     let mut refine = family.refine_config();
+    let mut resegment_threshold = family.resegment_threshold();
     if let Some(threshold) = args.refine_threshold {
         refine.merge_threshold = threshold;
+        resegment_threshold = threshold;
     }
     let refine_mode = args.refine_mode.unwrap_or_else(|| family.refine_mode());
     let refine_on = refine_mode != OfflineRefineMode::Off;
@@ -231,6 +233,7 @@ pub(crate) async fn run(args: DerArgs) -> Result<()> {
 
         let mut diarizer = OnlineDiarizer::new(family.load(&args.embedder)?, cluster)
             .with_offline_refinement_config(refine)
+            .with_resegment_threshold(resegment_threshold)
             .with_refine_mode(refine_mode);
         if let Some(seg) = &args.segmenter {
             diarizer = diarizer.with_segmenter(Box::new(
@@ -589,7 +592,7 @@ type SpanLog = Arc<Mutex<Vec<(u32, Vec<SpeakerSpan>)>>>;
 type PlanSlot = Arc<Mutex<Option<HashMap<SpanRef, SpeakerId>>>>;
 
 /// Forwards to the real diarizer, records each chunk's spans and keeps
-/// a copy of a re-segmenting refine plan.
+/// a copy of a re-segmenting refine plan returned within its deadline.
 struct RecordingDiarizer {
     inner: Box<dyn Diarizer>,
     log: SpanLog,
@@ -644,6 +647,11 @@ impl Diarizer for RecordingDiarizer {
 
     fn refine_plan(&self, budget: RefineBudget) -> Result<RefineOutcome, DomainError> {
         let outcome = self.inner.refine_plan(budget)?;
+        // The port forbids a late plan. Enforce it here so the pipeline
+        // discards a refine that missed its deadline (the online result
+        // stands) and the bench never scores a plan the app would not
+        // have applied.
+        budget.check()?;
         if let RefineOutcome::Relabel(plan) = &outcome {
             *self.plan.lock().expect("plan slot poisoned") =
                 Some(plan.spans.iter().copied().collect());
@@ -961,6 +969,15 @@ mod tests {
             RefineOutcome::Relabel(_)
         ));
         assert_eq!(plan.lock().unwrap().as_ref().map(HashMap::len), Some(1));
+
+        // A plan returned after the deadline is a failed refine: the
+        // pipeline keeps the online result, so the bench must not score it.
+        *plan.lock().unwrap() = None;
+        let late = RefineBudget {
+            deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+        };
+        assert!(d.refine_plan(late).is_err());
+        assert!(plan.lock().unwrap().is_none());
     }
 
     #[test]
