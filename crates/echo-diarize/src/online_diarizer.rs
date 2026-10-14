@@ -25,7 +25,7 @@ use crate::embedding::SpeakerEmbedder;
 use crate::embedding_log::{EmbeddingLog, EmbeddingLogEntry};
 use crate::offline_refine::{refine_speakers, OfflineRefineConfig};
 use crate::plda::Plda;
-use crate::presets::{OfflineRefineMode, DEFAULT_RESEGMENT_THRESHOLD};
+use crate::presets::OfflineRefineMode;
 use crate::resegment::{relabel_plan, too_short, OfflineReclusterer};
 use crate::vbx::{VbxConfig, VbxReclusterer};
 
@@ -70,9 +70,6 @@ pub struct OnlineDiarizer {
     /// Legacy opt-in ([`Self::with_offline_refinement`]): selects
     /// [`OfflineRefineMode::MergeOnly`] when no mode was set.
     refinement_requested: bool,
-    /// AHC cut of the re-segmentation's VBx initialisation (fixed cut, or
-    /// fallback of the calibrated one).
-    resegment_threshold: f32,
     /// PLDA model of the embedder; re-segmentation needs it (VBx) and
     /// falls back to the merge-only refine without it.
     plda: Option<Arc<Plda>>,
@@ -101,7 +98,6 @@ impl OnlineDiarizer {
             refine_config: OfflineRefineConfig::default(),
             explicit_refine_mode: None,
             refinement_requested: false,
-            resegment_threshold: DEFAULT_RESEGMENT_THRESHOLD,
             plda: None,
             vbx_config: VbxConfig::default(),
             dense_windows: false,
@@ -174,16 +170,6 @@ impl OnlineDiarizer {
         self.with_offline_refinement()
     }
 
-    /// Cosine similarity at which the re-segmenting AHC
-    /// ([`OfflineRefineMode::Resegment`]) stops merging. Independent of
-    /// the merge-only threshold in [`OfflineRefineConfig`]; per-embedder
-    /// values live in [`crate::EmbedderFamily::resegment_threshold`].
-    #[must_use]
-    pub fn with_resegment_threshold(mut self, threshold: f32) -> Self {
-        self.resegment_threshold = threshold;
-        self
-    }
-
     /// PLDA model of this embedder, which
     /// [`OfflineRefineMode::Resegment`] (VBx) requires. Per-embedder
     /// models come from [`crate::EmbedderFamily::plda`].
@@ -193,8 +179,9 @@ impl OnlineDiarizer {
         self
     }
 
-    /// VBx settings of the re-segmentation; per-embedder values live in
-    /// [`crate::EmbedderFamily::vbx_config`].
+    /// VBx settings of the re-segmentation, including its initialisation
+    /// cut in the PLDA's LDA space ([`crate::VbxInit`]); per-embedder
+    /// values live in [`crate::EmbedderFamily::vbx_config`].
     #[must_use]
     pub fn with_vbx_config(mut self, config: VbxConfig) -> Self {
         self.vbx_config = config;
@@ -220,32 +207,41 @@ impl OnlineDiarizer {
 
     /// Embeddings of the dense windows of `span` (empty when the span is
     /// not long enough or dense windows are off). Windows tile the span
-    /// without overlap, spread evenly; a window the embedder declines or
-    /// a non-finite vector is skipped.
-    fn window_embeddings(&mut self, span: &[Sample]) -> Result<Vec<Box<[f32]>>, DomainError> {
+    /// without overlap, spread evenly; a window the embedder declines,
+    /// fails on, or returns a non-finite vector for is skipped (failures
+    /// are logged as a count, never with the audio or a vector).
+    fn window_embeddings(&mut self, span: &[Sample]) -> Vec<Box<[f32]>> {
         let rate = u64::from(self.embedder.sample_rate_hz().max(1));
         let win = usize::try_from(rate * u64::from(DENSE_WINDOW_MS) / 1_000).unwrap_or(usize::MAX);
         let min = usize::try_from(rate * u64::from(DENSE_WINDOW_MIN_SPAN_MS) / 1_000)
             .unwrap_or(usize::MAX);
         if !self.dense_windows() || span.len() <= min || win == 0 {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let n = span.len() / win;
         let slack = span.len() - n * win;
         let mut out = Vec::with_capacity(n);
+        let mut failed = 0_usize;
         for i in 0..n {
             let start = i * win + if n > 1 { slack * i / (n - 1) } else { 0 };
-            if let Some(e) = self.embedder.embed(&span[start..start + win])? {
-                if e.iter().all(|x| x.is_finite()) {
-                    out.push(e.into_boxed_slice());
-                }
+            match self.embedder.embed(&span[start..start + win]) {
+                Ok(Some(e)) if e.iter().all(|x| x.is_finite()) => out.push(e.into_boxed_slice()),
+                Ok(_) => {}
+                Err(_) => failed += 1,
             }
         }
-        Ok(out)
+        if failed > 0 {
+            tracing::warn!(
+                failed,
+                windows = n,
+                "dense window embeddings failed; skipped"
+            );
+        }
+        out
     }
 
-    /// Re-segment the log with other VBx settings and AHC cut, whatever
-    /// the configured mode. Benchmarks use it to score several settings
+    /// Re-segment the log with other VBx settings, whatever the
+    /// configured mode. Benchmarks use it to score several settings
     /// on one session; the app calls [`Diarizer::refine_plan`].
     ///
     /// # Errors
@@ -255,7 +251,6 @@ impl OnlineDiarizer {
     pub fn resegment_with(
         &self,
         config: VbxConfig,
-        init_threshold: f32,
         budget: RefineBudget,
     ) -> Result<RefineOutcome, DomainError> {
         let Some(plda) = &self.plda else {
@@ -270,11 +265,24 @@ impl OnlineDiarizer {
         let labels = VbxReclusterer {
             plda: Arc::clone(plda),
             config,
-            init_threshold,
         }
         .recluster(entries, budget)?;
         budget.check()?;
         Ok(relabel_plan(entries, &self.cluster.speakers(), &labels))
+    }
+
+    /// Why re-segmentation cannot run with this embedder, or `None` when
+    /// a PLDA model of the right dimension is attached.
+    fn plda_unavailable(&self) -> Option<String> {
+        match &self.plda {
+            None => Some("no PLDA model for this embedder".into()),
+            Some(p) if p.dim() != self.embedder.dim() => Some(format!(
+                "the PLDA model expects {}-dim embeddings but the embedder produces {}",
+                p.dim(),
+                self.embedder.dim()
+            )),
+            Some(_) => None,
+        }
     }
 
     fn merge_only_plan(&self, budget: RefineBudget) -> Result<RefineOutcome, DomainError> {
@@ -360,7 +368,7 @@ impl OnlineDiarizer {
         // online as before, but never logged: it would poison the
         // end-of-session clustering.
         let id = if self.keeps_log() && embedding.iter().all(|x| x.is_finite()) {
-            let windows = self.window_embeddings(&samples[range.clone()])?;
+            let windows = self.window_embeddings(&samples[range.clone()]);
             let id = self.cluster.assign(embedding.clone());
             self.embedding_log.push(
                 EmbeddingLogEntry::new(
@@ -513,18 +521,21 @@ impl Diarizer for OnlineDiarizer {
             OfflineRefineMode::Off => Ok(RefineOutcome::Unchanged),
             OfflineRefineMode::MergeOnly => self.merge_only_plan(budget),
             OfflineRefineMode::Resegment => {
-                if self
-                    .plda
-                    .as_ref()
-                    .is_some_and(|p| p.dim() == self.embedder.dim())
-                {
-                    self.resegment_with(self.vbx_config, self.resegment_threshold, budget)
-                } else {
-                    tracing::info!(
-                        "no PLDA model for this embedder; re-segmentation falls back to merge-only"
+                if let Some(reason) = self.plda_unavailable() {
+                    tracing::info!("{reason}; re-segmentation falls back to merge-only");
+                    return self.merge_only_plan(budget);
+                }
+                // Fail-safe (ADR 0001, D6): a failed re-segmentation
+                // (deadline, too many frames, clustering error) degrades
+                // to the merge-only refine. That plan checks the same
+                // deadline, so a late refine still keeps the online result.
+                self.resegment_with(self.vbx_config, budget).or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "re-segmentation failed; falling back to merge-only"
                     );
                     self.merge_only_plan(budget)
-                }
+                })
             }
         }
     }
@@ -700,8 +711,16 @@ mod tests {
                 max_iters: 10,
                 epsilon: 1e-6,
             },
-            init_offset: None,
+            init: crate::vbx::VbxInit::Fixed(0.5),
             ..VbxConfig::default()
+        }
+    }
+
+    /// [`test_vbx`] with another fixed LDA-space initialisation cut.
+    fn test_vbx_cut(cut: f32) -> VbxConfig {
+        VbxConfig {
+            init: crate::vbx::VbxInit::Fixed(cut),
+            ..test_vbx()
         }
     }
 
@@ -711,9 +730,8 @@ mod tests {
                 merge_threshold: threshold,
                 ..OfflineRefineConfig::default()
             })
-            .with_resegment_threshold(threshold)
             .with_plda(Arc::new(crate::plda::tests::identity(4, 25.0)))
-            .with_vbx_config(test_vbx())
+            .with_vbx_config(test_vbx_cut(threshold))
             .with_refine_mode(mode)
     }
 
@@ -831,7 +849,6 @@ mod tests {
                 merge_threshold: -0.5,
                 ..OfflineRefineConfig::default()
             })
-            .with_resegment_threshold(0.5)
             .with_plda(Arc::new(crate::plda::tests::identity(4, 25.0)))
             .with_vbx_config(test_vbx())
             .with_refine_mode(OfflineRefineMode::Resegment);
@@ -846,7 +863,7 @@ mod tests {
                 merge_threshold: -0.5,
                 ..OfflineRefineConfig::default()
             })
-            .with_resegment_threshold(-0.5)
+            .with_vbx_config(test_vbx_cut(-0.5))
             .with_refine_mode(OfflineRefineMode::Resegment);
         feed(&mut d, &[0.001, 0.002, 0.001, 0.002, 0.001]).await;
         assert!(matches!(
@@ -867,6 +884,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failing_resegment_falls_back_to_merge_only() {
+        // fb = 0 makes VBx reject its parameters: the refine must still
+        // return the merge-only plan, not an error (ADR 0001, D6).
+        let bad = VbxConfig {
+            params: crate::vbx::VbxParams {
+                fb: 0.0,
+                ..test_vbx().params
+            },
+            ..test_vbx()
+        };
+        let mut d = diarizer(OfflineRefineMode::Resegment, -0.5).with_vbx_config(bad);
+        feed(&mut d, &[0.001, 0.002, 0.001, 0.002, 0.001]).await;
+        assert!(d.resegment_with(bad, budget()).is_err());
+        assert!(matches!(
+            d.refine_plan(budget()).unwrap(),
+            RefineOutcome::Merges(m) if m.len() == 1
+        ));
+    }
+
+    #[test]
+    fn the_fallback_reason_tells_a_missing_plda_from_a_wrong_dimension() {
+        let none = OnlineDiarizer::with_defaults(Box::new(StubEmbedder::new()));
+        assert!(none.plda_unavailable().unwrap().contains("no PLDA model"));
+        let wrong = none.with_plda(Arc::new(crate::plda::tests::identity(3, 25.0)));
+        let reason = wrong.plda_unavailable().unwrap();
+        assert!(reason.contains('3') && reason.contains('4'), "{reason}");
+        assert!(!reason.contains("no PLDA model"), "{reason}");
+        let ok = OnlineDiarizer::with_defaults(Box::new(StubEmbedder::new()))
+            .with_plda(Arc::new(crate::plda::tests::identity(4, 25.0)));
+        assert_eq!(ok.plda_unavailable(), None);
+    }
+
+    #[tokio::test]
     async fn resegment_with_moves_a_misattributed_span_back() {
         // Online, the third chunk (axis 1) joins speaker 0 because the
         // test cluster is lenient; VBx separates the two voices again.
@@ -879,7 +929,6 @@ mod tests {
         )
         .with_plda(Arc::new(crate::plda::tests::identity(4, 25.0)))
         .with_vbx_config(test_vbx())
-        .with_resegment_threshold(0.5)
         .with_refine_mode(OfflineRefineMode::Resegment);
         feed(&mut d, &[0.001, 0.001, 0.002, 0.002, 0.001, 0.002]).await;
         assert_eq!(d.speakers().len(), 1, "online put every chunk together");
@@ -984,6 +1033,37 @@ mod tests {
             windows_and_calls(OfflineRefineMode::Resegment, true, 48_000).await,
             (0, 1)
         );
+    }
+
+    /// Embedder that fails on window-length input but embeds whole spans.
+    struct WindowFailingEmbedder;
+
+    impl SpeakerEmbedder for WindowFailingEmbedder {
+        fn sample_rate_hz(&self) -> u32 {
+            16_000
+        }
+        fn dim(&self) -> usize {
+            4
+        }
+        fn embed(&mut self, samples: &[Sample]) -> Result<Option<Vec<f32>>, DomainError> {
+            if samples.len() == 24_000 && samples[0] > 0.15 {
+                return Err(DomainError::DiarizationFailed("window failed".into()));
+            }
+            Ok(Some(vec![1.0, 0.0, 0.0, 0.0]))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_window_is_skipped_not_the_whole_span() {
+        // 4.5 s span: three 1.5 s windows; the middle one fails.
+        let mut span = vec![0.1_f32; 72_000];
+        span[24_000..48_000].fill(0.2);
+        let mut d = OnlineDiarizer::with_defaults(Box::new(WindowFailingEmbedder))
+            .with_dense_windows(true)
+            .with_refine_mode(OfflineRefineMode::Resegment);
+        let spans = d.assign_spans(&span).await.unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(d.log().first().map(|e| e.windows.len()), Some(2));
     }
 
     #[tokio::test]

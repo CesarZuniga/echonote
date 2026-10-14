@@ -83,13 +83,17 @@ fn deadline_error() -> DomainError {
 ///   the frames are held once.
 /// * `phi` — the `D` across-class variances.
 /// * `gamma` — `T x S` initial responsibilities (rows sum to one).
-/// * `run_starts` — indices of frames (besides 0) that start a new
-///   independent run, in increasing order.
+/// * `run_starts` — indices of frames (besides 0, which always starts a
+///   run) that start a new independent run: strictly increasing, each in
+///   `1..T`.
 ///
 /// # Errors
 ///
-/// [`DomainError::DiarizationFailed`] once `deadline` has passed, or when
-/// the shapes disagree.
+/// [`DomainError::DiarizationFailed`] once `deadline` has passed, when
+/// the shapes disagree, for a non-finite frame, responsibility or
+/// variance, a negative `phi` or `gamma` value, out-of-range parameters
+/// (`fa` and `fb` must be finite and positive, `loop_p` within `0..=1`)
+/// or `run_starts` outside its contract.
 pub fn vbx(
     mut x: Vec<f64>,
     phi: &[f64],
@@ -111,13 +115,19 @@ pub fn vbx(
         ));
     }
     let s = gamma.len() / t_len;
+    validate(&x, phi, &gamma, params)?;
     let mut is_start = vec![false; t_len];
-    for &i in run_starts {
-        if i < t_len {
-            is_start[i] = true;
-        }
-    }
     is_start[0] = true;
+    let mut previous = 0;
+    for &i in run_starts {
+        if i <= previous || i >= t_len {
+            return Err(DomainError::DiarizationFailed(format!(
+                "VBx: run start {i} is not increasing within 1..{t_len}"
+            )));
+        }
+        is_start[i] = true;
+        previous = i;
+    }
 
     let ln_2pi = (2.0 * std::f64::consts::PI).ln();
     let g: Vec<f64> = x
@@ -206,6 +216,31 @@ pub fn vbx(
         }
     }
     Ok(VbxOutput { gamma, pi, elbo })
+}
+
+/// Reject inputs the VB updates are not defined for, so a bad model or
+/// setting fails here instead of producing NaN posteriors.
+fn validate(x: &[f64], phi: &[f64], gamma: &[f64], params: VbxParams) -> Result<(), DomainError> {
+    let fail = |what: &str| Err(DomainError::DiarizationFailed(format!("VBx: {what}")));
+    if !x.iter().all(|v| v.is_finite()) {
+        return fail("non-finite frame");
+    }
+    if !phi.iter().all(|v| v.is_finite() && *v >= 0.0) {
+        return fail("phi must be finite and non-negative");
+    }
+    if !gamma.iter().all(|v| v.is_finite() && *v >= 0.0) {
+        return fail("gamma must be finite and non-negative");
+    }
+    if !(params.fa.is_finite() && params.fa > 0.0) {
+        return fail("fa must be finite and positive");
+    }
+    if !(params.fb.is_finite() && params.fb > 0.0) {
+        return fail("fb must be finite and positive");
+    }
+    if !(0.0..=1.0).contains(&params.loop_p) {
+        return fail("loop_p must be within 0..=1");
+    }
+    Ok(())
 }
 
 /// Forward-backward pass output.
@@ -365,16 +400,35 @@ pub fn two_gmm_threshold(scores: &[f32]) -> Option<f64> {
     threshold.is_finite().then_some(threshold)
 }
 
+/// How the VBx responsibilities are initialised.
+///
+/// Every threshold here is a cosine similarity between PLDA-transformed
+/// embeddings, `y` in [`crate::plda`]: the length-normalised LDA space
+/// where the AHC runs. It is not comparable with the raw-embedding
+/// cosine thresholds of the online clustering or the merge-only refine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VbxInit {
+    /// AHC cut at the per-recording two-Gaussian threshold of the
+    /// pairwise LDA-space similarities plus `offset` (the VBx recipe).
+    /// `fallback` is the cut when the scores cannot be calibrated (fewer
+    /// than two distinct values).
+    Calibrated {
+        /// Added to the calibrated threshold.
+        offset: f32,
+        /// LDA-space cut when the calibration is impossible.
+        fallback: f32,
+    },
+    /// AHC cut at a fixed LDA-space similarity.
+    Fixed(f32),
+}
+
 /// Settings of the VBx re-segmentation ([`VbxReclusterer`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VbxConfig {
     /// VB-HMM hyper-parameters.
     pub params: VbxParams,
-    /// AHC initialisation cut: `Some(offset)` uses the per-recording
-    /// two-Gaussian threshold plus `offset` (the VBx recipe), `None` a
-    /// fixed similarity (the diarizer's re-segmentation threshold). Both
-    /// cut cosine similarities in the PLDA's LDA space.
-    pub init_offset: Option<f32>,
+    /// Initial clustering VBx starts from.
+    pub init: VbxInit,
     /// Sharpness of the initial responsibilities: each frame starts with
     /// `softmax(smoothing * one_hot(ahc_label))`.
     pub init_smoothing: f64,
@@ -385,6 +439,12 @@ pub struct VbxConfig {
     /// matrices.
     pub max_speakers: usize,
 }
+
+/// LDA-space AHC cut used when the two-Gaussian calibration of
+/// [`VbxInit::Calibrated`] is impossible in the default configuration.
+/// It sits in the flat region of the fixed-cut grid of the multilingual
+/// CAM++ dev sets (`docs/spikes/2026-10-vbx.md`, T10b).
+pub const DEFAULT_INIT_FALLBACK: f32 = 0.45;
 
 impl Default for VbxConfig {
     /// The BUTSpeechFIT example recipe (`run_example.sh`): Fa 0.3, Fb 17,
@@ -398,7 +458,10 @@ impl Default for VbxConfig {
                 max_iters: 40,
                 epsilon: 1e-6,
             },
-            init_offset: Some(-0.015),
+            init: VbxInit::Calibrated {
+                offset: -0.015,
+                fallback: DEFAULT_INIT_FALLBACK,
+            },
             init_smoothing: 5.0,
             lda_dim: 128,
             max_speakers: 20,
@@ -425,9 +488,6 @@ pub(crate) struct VbxReclusterer {
     pub plda: Arc<Plda>,
     /// VBx settings.
     pub config: VbxConfig,
-    /// Fixed AHC cut when [`VbxConfig::init_offset`] is `None`, and the
-    /// fallback when the calibration is impossible.
-    pub init_threshold: f32,
 }
 
 /// One VBx frame: an embedding and the log entry it votes for.
@@ -484,16 +544,22 @@ impl OfflineReclusterer for VbxReclusterer {
         let y: Vec<Vec<f32>> = frames
             .iter()
             .map(|f| self.plda.transform(f.embedding))
-            .collect();
+            .collect::<Result<_, _>>()?;
         let refs: Vec<&[f32]> = y.iter().map(Vec::as_slice).collect();
-        let cut = match self.config.init_offset {
-            Some(offset) => AhcCut::Calibrated {
-                offset,
-                fallback: self.init_threshold,
-            },
-            None => AhcCut::Similarity(self.init_threshold),
+        let init = match self.config.init {
+            VbxInit::Calibrated { offset, fallback } => strided_ahc(
+                &refs,
+                AhcCut::Calibrated { offset, fallback },
+                VBX_INIT_MAX_REPRESENTATIVES,
+                budget,
+            )?,
+            VbxInit::Fixed(cut) => strided_ahc(
+                &refs,
+                AhcCut::Similarity(cut),
+                VBX_INIT_MAX_REPRESENTATIVES,
+                budget,
+            )?,
         };
-        let init = strided_ahc(&refs, cut, VBX_INIT_MAX_REPRESENTATIVES, budget)?;
         let (init, s) = keep_largest(init, &refs, self.config.max_speakers.max(1));
 
         let t_len = frames.len();
@@ -504,7 +570,10 @@ impl OfflineReclusterer for VbxReclusterer {
             gamma[t * s + label] = on / z;
         }
         let dim = self.config.lda_dim.clamp(1, self.plda.lda_dim());
-        let x: Vec<f64> = y.iter().flat_map(|v| self.plda.project(v, dim)).collect();
+        let mut x: Vec<f64> = Vec::with_capacity(t_len * dim);
+        for v in &y {
+            x.extend(self.plda.project(v, dim)?);
+        }
         drop(refs);
         drop(y);
         let phi: Vec<f64> = self.plda.psi()[..dim]
@@ -782,10 +851,9 @@ mod tests {
                     max_iters: 10,
                     epsilon: 1e-6,
                 },
-                init_offset: None,
+                init: VbxInit::Fixed(0.5),
                 ..VbxConfig::default()
             },
-            init_threshold: 0.5,
         }
     }
 
@@ -834,6 +902,110 @@ mod tests {
         let (labels, k) = keep_largest(vec![0, 0, 1, 1, 2], &refs, 2);
         assert_eq!(k, 2);
         assert_eq!(labels, vec![0, 0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn non_finite_inputs_and_bad_parameters_are_errors() {
+        let bad = |x: Vec<f64>, phi: &[f64], gamma: Vec<f64>, p: VbxParams| {
+            vbx(x, phi, gamma, &[], p, far()).is_err()
+        };
+        let mut x = X.to_vec();
+        x[4] = f64::NAN;
+        assert!(bad(x, &PHI, init(), params()), "NaN frame");
+        let mut g = init();
+        g[2] = f64::INFINITY;
+        assert!(bad(X.to_vec(), &PHI, g, params()), "infinite gamma");
+        assert!(
+            bad(X.to_vec(), &[4.0, -2.0, 0.5], init(), params()),
+            "phi < 0"
+        );
+        assert!(
+            bad(X.to_vec(), &[4.0, f64::NAN, 0.5], init(), params()),
+            "NaN phi"
+        );
+        for (name, p) in [
+            (
+                "fb = 0",
+                VbxParams {
+                    fb: 0.0,
+                    ..params()
+                },
+            ),
+            (
+                "fb < 0",
+                VbxParams {
+                    fb: -1.0,
+                    ..params()
+                },
+            ),
+            (
+                "fa NaN",
+                VbxParams {
+                    fa: f64::NAN,
+                    ..params()
+                },
+            ),
+            (
+                "fa inf",
+                VbxParams {
+                    fa: f64::INFINITY,
+                    ..params()
+                },
+            ),
+            (
+                "loopP > 1",
+                VbxParams {
+                    loop_p: 1.5,
+                    ..params()
+                },
+            ),
+            (
+                "loopP < 0",
+                VbxParams {
+                    loop_p: -0.1,
+                    ..params()
+                },
+            ),
+            (
+                "loopP NaN",
+                VbxParams {
+                    loop_p: f64::NAN,
+                    ..params()
+                },
+            ),
+        ] {
+            assert!(bad(X.to_vec(), &PHI, init(), p), "{name}");
+        }
+    }
+
+    #[test]
+    fn run_starts_out_of_range_or_not_increasing_are_errors() {
+        let run = |starts: &[usize]| vbx(X.to_vec(), &PHI, init(), starts, params(), far());
+        assert!(run(&[3, 7]).is_ok());
+        assert!(run(&[10]).is_err(), "past the last frame");
+        assert!(run(&[0]).is_err(), "frame 0 always starts a run");
+        assert!(run(&[7, 3]).is_err(), "decreasing");
+        assert!(run(&[3, 3]).is_err(), "repeated");
+    }
+
+    #[test]
+    fn a_run_start_makes_vbx_treat_identical_runs_identically() {
+        // The sequence repeated twice. As two independent runs, both
+        // copies see the same speaker models and are both entered from
+        // the priors, so their posteriors match frame for frame. Joined
+        // as one run, the second copy's first frame depends on the
+        // first copy's last frame and the posteriors differ.
+        let x: Vec<f64> = X.iter().chain(&X).copied().collect();
+        let gamma: Vec<f64> = init().into_iter().chain(init()).collect();
+        let split = vbx(x.clone(), &PHI, gamma.clone(), &[10], params(), far()).unwrap();
+        let (a, b) = split.gamma.split_at(30);
+        close(a, b, 1e-12);
+        let joined = vbx(x, &PHI, gamma, &[], params(), far()).unwrap();
+        let (a, b) = joined.gamma.split_at(30);
+        assert!(
+            a.iter().zip(b).any(|(p, q)| (p - q).abs() > 1e-6),
+            "without a run start the copies are coupled"
+        );
     }
 
     #[test]
