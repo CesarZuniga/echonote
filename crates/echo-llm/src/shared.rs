@@ -1,15 +1,15 @@
 //! State shared between every llama.cpp-backed adapter in this crate.
 //!
-//! [`LoadedModel`] holds the heavy bits — the `LlamaBackend` singleton
+//! [`LoadedModel`] holds the heavy bits - the `LlamaBackend` singleton
 //! (leaked, lives for the process), the loaded `LlamaModel` (~10 GB
 //! for Qwen 3 14B Q4_K_M) and the configuration knobs that decide how
-//! per-request `LlamaContext`s are constructed.
+//! the decoding context is constructed. [`SharedModel`] pairs it with the
+//! [`Worker`] thread that owns the one reusable context.
 //!
 //! Every adapter ([`crate::LlamaCppLlm`] for one-shot summaries,
 //! [`crate::LlamaCppChat`] for streaming chat) wraps an
-//! `Arc<LoadedModel>`. Cloning the `Arc` is free, which is what lets
-//! the application layer build both ports off the same loaded model
-//! and serve them concurrently:
+//! `Arc<SharedModel>`. Cloning the `Arc` is free, which is what lets
+//! the application layer build both ports off the same loaded model:
 //!
 //! ```text
 //! let llm  = LlamaCppLlm::load("qwen3-14b.gguf")?;   // 10 GB resident
@@ -18,20 +18,18 @@
 //!
 //! ## Concurrency model
 //!
-//! `LlamaModel` is `Send + Sync`. llama.cpp tolerates **multiple
-//! `LlamaContext`s** built from the same model running in parallel —
-//! each context owns its own KV cache, so the only constraint is host
-//! RAM (one KV cache per concurrent request, ~1.2 GB for Qwen3-8B at the default
-//! `n_ctx`). The single decoding constraint is **per-context**: a
-//! single context cannot be decoded from two threads at once, but the
-//! adapters in this crate never share a context across calls (each
-//! call constructs a fresh one and drops it on completion).
+//! `LlamaModel` is `Send + Sync`, but a `LlamaContext` borrows it, is not
+//! `Send`, and cannot be decoded from two threads at once. The crate
+//! therefore keeps **one** context (one KV cache, ~1.2 GB for Qwen3-8B at
+//! the default `n_ctx`) alive on a dedicated worker thread and serves
+//! summary and chat requests through it one at a time, chat first
+//! (see [`crate::worker`]). Requests do not pay for context creation, and
+//! the context is released after [`CONTEXT_IDLE_TIMEOUT`] without
+//! requests so an idle app does not pin the KV cache.
 //!
-//! That removes any need for a `tokio::sync::Mutex` between summary
-//! and chat. The decision was originally documented in
-//! `docs/SPRINT-1-STATUS.md` §8.3 as "share with mutex"; reading the
-//! existing adapter code revealed mutex-free sharing is what we
-//! actually have, and the doc has been updated accordingly.
+//! Dropping the last `Arc<SharedModel>` shuts the worker down: the running
+//! request is aborted, queued ones fail, the thread drops its context and
+//! exits, and the model is freed.
 //!
 //! ## Why this lives in its own module
 //!
@@ -42,12 +40,23 @@
 //! fake adapter that doesn't go through llama.cpp doesn't depend on
 //! this module at all.
 
+use std::ops::Deref;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+use std::time::Duration;
 
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 
-use echo_domain::estimate_tokens;
+use echo_domain::{estimate_tokens, DomainError};
+
+use crate::llama_engine::LlamaSource;
+use crate::worker::{Job, Worker};
+
+/// How long the persistent context may sit unused before it is dropped to
+/// free its KV cache. The next request recreates it.
+pub(crate) const CONTEXT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 // ---------------------------------------------------------------------------
 // Think-block stripping (Qwen 3 reasoning suppression)
@@ -89,16 +98,13 @@ pub(crate) fn strip_think_blocks(text: &str) -> String {
     result
 }
 
-/// Per-process loaded model + the knobs needed to spawn a per-request
+/// Per-process loaded model + the knobs needed to build the decoding
 /// context.
-///
-/// Held inside `Arc<LoadedModel>` by every adapter — the `Arc` is the
-/// only sharing primitive needed.
 pub(crate) struct LoadedModel {
     /// Backend handle. Leaked once per process by [`crate::backend::backend_singleton`].
     pub backend: &'static LlamaBackend,
     /// The loaded model. `Send + Sync`; safe to access from any thread,
-    /// including from concurrent `new_context` calls.
+    /// including from the worker thread.
     pub model: LlamaModel,
     /// Stable id reported to the application layer. Either the file
     /// stem (e.g. `qwen3-14b-instruct-q4_k_m`) or the override the
@@ -107,8 +113,8 @@ pub(crate) struct LoadedModel {
     /// Path the model was loaded from. Surfaced for telemetry +
     /// "regenerate with model X" UX flows.
     pub model_path: PathBuf,
-    /// Context window in tokens, applied to every per-request
-    /// `LlamaContext` we build.
+    /// Context window in tokens, applied to the `LlamaContext` the worker
+    /// builds.
     pub n_ctx: u32,
     /// Optional decoder thread count. `None` defers to llama.cpp's
     /// default (typically `num_cpus`). Useful in tests.
@@ -126,6 +132,55 @@ impl LoadedModel {
     /// be able to abort a request the estimate could still size safely.
     pub fn count_tokens(&self, text: &str) -> usize {
         token_count_or_estimate(self.model.str_to_token(text, AddBos::Never), text)
+    }
+}
+
+/// A [`LoadedModel`] plus the worker thread that owns its reusable
+/// context. Held inside `Arc<SharedModel>` by every adapter.
+///
+/// Derefs to the [`LoadedModel`] for read-only access to the model and its
+/// settings.
+pub(crate) struct SharedModel {
+    loaded: Arc<LoadedModel>,
+    worker: Worker,
+    /// Prompt tokens the latest request reused from the KV cache; written
+    /// by this model's engine only. Read through
+    /// [`Self::last_reused_tokens`] (tests and the `test-hooks` feature).
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    reused: Arc<AtomicUsize>,
+}
+
+impl SharedModel {
+    /// Wrap `loaded`; the worker thread starts on the first request.
+    pub(crate) fn new(loaded: LoadedModel) -> Self {
+        let loaded = Arc::new(loaded);
+        let reused = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(LlamaSource::new(Arc::clone(&loaded), Arc::clone(&reused)));
+        Self {
+            loaded,
+            worker: Worker::new(source, CONTEXT_IDLE_TIMEOUT),
+            reused,
+        }
+    }
+
+    /// Prompt tokens the latest request on this model reused from the KV
+    /// cache.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn last_reused_tokens(&self) -> usize {
+        self.reused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Queue a request on the worker thread.
+    pub(crate) fn submit(&self, job: Job) -> Result<(), DomainError> {
+        self.worker.submit(job)
+    }
+}
+
+impl Deref for SharedModel {
+    type Target = LoadedModel;
+
+    fn deref(&self) -> &LoadedModel {
+        &self.loaded
     }
 }
 

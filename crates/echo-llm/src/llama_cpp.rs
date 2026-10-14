@@ -1,43 +1,54 @@
 //! llama.cpp adapter via [`llama-cpp-2`].
 //!
 //! Loads a `.gguf` model into memory once, then serves
-//! [`echo_domain::LlmModel::generate`] calls by spinning up a fresh
-//! decoding context per request. Generation runs on
-//! `tokio::task::spawn_blocking` so the async runtime is never blocked
-//! by the inference loop.
+//! [`echo_domain::LlmModel::generate`] calls through one persistent
+//! decoding context owned by a dedicated worker thread (see
+//! [`crate::worker`]). The context, and with it the ~1.2 GB KV cache, is
+//! created by the first request, reused by the following ones and dropped
+//! after five minutes without requests; the next request recreates it.
 //!
 //! ## Threading model
 //!
-//! * `LlamaBackend::init()` is a process-wide singleton — guarded by a
+//! * `LlamaBackend::init()` is a process-wide singleton - guarded by a
 //!   `OnceLock` so multiple `LlamaCppLlm::load` calls (tests + runtime)
 //!   don't trip the "backend already initialised" error.
-//! * The model is loaded once into an `Arc<LoadedModel>` and shared
-//!   across every generation request — and across every adapter
-//!   built from it (see [`Self::chat_handle`]). Contexts are cheap to
-//!   create relative to model loading, so each request gets its own.
-//! * The inference loop is synchronous; we wrap it in `spawn_blocking`
-//!   so a long summary doesn't stall the rest of the runtime.
+//! * The model is loaded once into an `Arc<SharedModel>` and shared
+//!   across every generation request - and across every adapter
+//!   built from it (see [`Self::chat_handle`]).
+//! * A `LlamaContext` is not `Send`, so the worker thread creates it and
+//!   serves every request (summary and chat alike) one at a time; queued
+//!   chat turns go ahead of queued summary calls, a running call is never
+//!   preempted. The async side only queues a job and awaits its
+//!   output, so a long summary doesn't stall the rest of the runtime.
+//!   A caller that drops its stream or future cancels the job: decoding
+//!   stops at the next token and the queue moves on. A caller that stops
+//!   draining its stream is cut off after a bounded stall and, once it
+//!   resumes, sees an error item rather than a clean end.
+//! * The worker keeps the tokens resident in the KV cache and, for each
+//!   request, only evaluates the part of the prompt after the first
+//!   difference with the previous one (see [`crate::llama_engine`]): a
+//!   follow-up chat turn skips the system prompt and transcript it shares
+//!   with the turn before.
 
-use std::num::NonZeroU32;
 use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream, StreamExt};
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_batch::LlamaBatch;
+use futures::stream::{self, BoxStream};
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::sampling::LlamaSampler;
-use tokio::sync::mpsc;
-use tracing::{debug, info, instrument, warn};
+use llama_cpp_2::model::LlamaModel;
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, info, instrument};
 
 use echo_domain::{DomainError, GenerateOptions, LlmModel};
 
 use crate::backend::backend_singleton;
 use crate::llama_cpp_chat::LlamaCppChat;
-use crate::shared::LoadedModel;
+use crate::shared::{LoadedModel, SharedModel};
+use crate::worker::{
+    drain_stream, Cancel, Flow, Job, Outlet, PieceSink, Priority, SamplingParams, Sink,
+};
 
 /// Default context window when the caller does not override it. Both
 /// Qwen 3 8B and 14B ship with `n_ctx_train = 32_768`; 8192 holds the
@@ -48,7 +59,9 @@ use crate::shared::LoadedModel;
 /// transcript when it fits and, otherwise, the excerpts retrieved for the
 /// question.
 ///
-/// The KV cache is the cost that scales with it. Computed (not
+/// The KV cache is the cost that scales with it, and it stays allocated
+/// while the persistent context lives (from the first request until five
+/// minutes without requests). Computed (not
 /// measured) from the published Qwen3-8B config — 36 layers, 8 KV
 /// heads, head_dim 128, f16 keys and values — it takes
 /// 36 * 8 * 128 * 2 * 2 B = 144 KiB per token, about 1.2 GB per
@@ -60,10 +73,6 @@ const DEFAULT_N_CTX: u32 = 8_192;
 /// Number of model layers to offload to the GPU when Metal/CUDA is
 /// available. `999` means "all of them"; llama.cpp clamps internally.
 const DEFAULT_N_GPU_LAYERS: u32 = 999;
-
-/// Initial size of the decoding batch. We resize on demand if the
-/// prompt is larger.
-const INITIAL_BATCH_TOKENS: usize = 512;
 
 /// mpsc buffer for streaming generation. Same reasoning as
 /// `llama_cpp_chat::STREAM_BUFFER`.
@@ -141,7 +150,7 @@ impl LoadOptions {
 /// from the same loaded model, call [`Self::chat_handle`].
 #[derive(Clone)]
 pub struct LlamaCppLlm {
-    inner: Arc<LoadedModel>,
+    inner: Arc<SharedModel>,
 }
 
 impl std::fmt::Debug for LlamaCppLlm {
@@ -192,14 +201,14 @@ impl LlamaCppLlm {
             .map_err(|e| DomainError::ModelNotLoaded(format!("llama.cpp: {e}")))?;
 
         Ok(Self {
-            inner: Arc::new(LoadedModel {
+            inner: Arc::new(SharedModel::new(LoadedModel {
                 backend,
                 model,
                 model_id,
                 model_path: path.to_path_buf(),
                 n_ctx: opts.n_ctx,
                 n_threads: opts.n_threads,
-            }),
+            })),
         })
     }
 
@@ -224,6 +233,19 @@ impl LlamaCppLlm {
     #[must_use]
     pub fn chat_handle(&self) -> LlamaCppChat {
         LlamaCppChat::from_loaded(Arc::clone(&self.inner))
+    }
+
+    /// Prompt tokens the latest request on this model reused from the KV
+    /// cache (`0` on a cold cache).
+    ///
+    /// Scoped to this model, so other models or tests cannot disturb it.
+    /// Test support for the gated real-model suites, behind the
+    /// `test-hooks` feature; not part of the stable API.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_reused_tokens(&self) -> usize {
+        self.inner.last_reused_tokens()
     }
 }
 
@@ -251,16 +273,21 @@ impl LlmModel for LlamaCppLlm {
             return Ok(String::new());
         }
 
-        let inner = Arc::clone(&self.inner);
-        let prompt = prompt.to_string();
-        let options = options.clone();
-
-        // llama.cpp's decode loop is CPU/GPU-bound and synchronous.
-        // Move it off the runtime so other IPC handlers stay
-        // responsive.
-        tokio::task::spawn_blocking(move || generate_blocking(&inner, &prompt, &options))
-            .await
-            .map_err(|e| DomainError::LlmFailed(format!("generate join: {e}")))?
+        // llama.cpp's decode loop is CPU/GPU-bound and synchronous; the
+        // worker thread runs it so other IPC handlers stay responsive.
+        let (done, rx) = oneshot::channel();
+        self.inner.submit(Job {
+            priority: Priority::Background,
+            prompt: prompt.to_string(),
+            params: SamplingParams::from_generate(options),
+            sink: Box::new(CollectSink {
+                output: String::new(),
+                stops: options.stop.clone(),
+                done,
+            }),
+        })?;
+        rx.await
+            .map_err(|_| DomainError::LlmFailed("generation worker dropped the request".into()))?
     }
 
     #[instrument(skip(self, prompt, options), fields(prompt_chars = prompt.len(), max_tokens = options.max_tokens))]
@@ -273,309 +300,126 @@ impl LlmModel for LlamaCppLlm {
             return Ok(Box::pin(stream::once(async { Ok(String::new()) })));
         }
 
-        let inner = Arc::clone(&self.inner);
-        let prompt = prompt.to_string();
-        let options = options.clone();
-
         let (tx, rx) = mpsc::channel::<Result<String, DomainError>>(STREAM_BUFFER);
-
-        tokio::task::spawn_blocking(move || {
-            generate_stream_blocking(&inner, &prompt, &options, &tx);
-        });
-
-        let stream = stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        })
-        .boxed();
+        let out = Outlet::new(tx);
+        let stream = drain_stream(rx, out.stall_mark());
+        self.inner.submit(Job {
+            priority: Priority::Background,
+            prompt: prompt.to_string(),
+            params: SamplingParams::from_generate(options),
+            sink: Box::new(StreamSink::new(options.stop.clone(), out)),
+        })?;
         Ok(stream)
     }
 }
 
-/// Synchronous inference loop. Lives in its own function (rather than
-/// inlined into the trait impl) so it's easy to call from
-/// `cargo test --features ...` smoke tests without going through the
-/// async machinery.
-fn generate_blocking(
-    inner: &LoadedModel,
-    prompt: &str,
-    options: &GenerateOptions,
-) -> Result<String, DomainError> {
-    let n_ctx = NonZeroU32::new(inner.n_ctx)
-        .ok_or_else(|| DomainError::Invariant("n_ctx must be > 0".into()))?;
+/// [`Sink`] behind [`LlamaCppLlm::generate`]: accumulates the reply,
+/// trims it at the first stop sequence and resolves a oneshot with the
+/// think-stripped text.
+struct CollectSink {
+    output: String,
+    stops: Vec<String>,
+    done: oneshot::Sender<Result<String, DomainError>>,
+}
 
-    let mut ctx_params = LlamaContextParams::default()
-        .with_n_ctx(Some(n_ctx))
-        .with_n_batch(inner.n_ctx);
-    if let Some(threads) = inner.n_threads {
-        ctx_params = ctx_params.with_n_threads(threads);
-        ctx_params = ctx_params.with_n_threads_batch(threads);
-    }
-
-    let mut ctx = inner
-        .model
-        .new_context(inner.backend, ctx_params)
-        .map_err(|e| DomainError::LlmFailed(format!("create context: {e}")))?;
-
-    // ---- tokenize prompt ----------------------------------------------------
-    // The use-case layer is responsible for wrapping the prompt with
-    // the model's chat template (`<|im_start|>` for Qwen, `<s>[INST]`
-    // for Llama, …) — including any BOS markers that template
-    // requires. We therefore pass `AddBos::Never` so we don't end up
-    // with a duplicate BOS for templates that already include one.
-    let prompt_tokens = inner
-        .model
-        .str_to_token(prompt, AddBos::Never)
-        .map_err(|e| DomainError::LlmFailed(format!("tokenize prompt: {e}")))?;
-
-    let n_prompt = prompt_tokens.len() as i32;
-    let n_max_total = n_prompt.saturating_add(options.max_tokens.min(i32::MAX as u32) as i32);
-    if (n_max_total as u32) > inner.n_ctx {
-        return Err(DomainError::LlmFailed(format!(
-            "prompt ({} tok) + max_tokens ({}) exceeds context window ({})",
-            n_prompt, options.max_tokens, inner.n_ctx
-        )));
-    }
-
-    // ---- prime the KV cache with the prompt --------------------------------
-    let batch_capacity = prompt_tokens.len().max(INITIAL_BATCH_TOKENS);
-    let mut batch = LlamaBatch::new(batch_capacity, 1);
-    let last_index = (prompt_tokens.len() as i32) - 1;
-    for (i, token) in (0_i32..).zip(prompt_tokens) {
-        let is_last = i == last_index;
-        batch
-            .add(token, i, &[0], is_last)
-            .map_err(|e| DomainError::LlmFailed(format!("batch.add prompt: {e}")))?;
-    }
-    ctx.decode(&mut batch)
-        .map_err(|e| DomainError::LlmFailed(format!("decode prompt: {e}")))?;
-
-    // ---- sampler chain ------------------------------------------------------
-    // Greedy when the caller asks for it (temp == 0), otherwise a
-    // top-p + temperature stack. `dist` is always last so it produces
-    // the final token from whatever distribution the previous samplers
-    // shaped.
-    let seed = options.seed.map_or(1234, |s| s as u32);
-    let temp = options.temperature.clamp(0.0, 2.0);
-    let top_p = options.top_p.clamp(0.0, 1.0);
-    let mut sampler = if temp <= f32::EPSILON {
-        LlamaSampler::chain_simple([LlamaSampler::greedy()])
-    } else {
-        LlamaSampler::chain_simple([
-            LlamaSampler::top_p(top_p, 1),
-            LlamaSampler::temp(temp),
-            LlamaSampler::dist(seed),
-        ])
-    };
-
-    // ---- decode loop --------------------------------------------------------
-    let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut output = String::new();
-    let mut n_cur = batch.n_tokens();
-    let mut n_decoded: u32 = 0;
-    let max_new = options.max_tokens;
-
-    debug!(
-        n_prompt,
-        n_ctx = inner.n_ctx,
-        max_new,
-        temp,
-        top_p,
-        "starting llama decode loop"
-    );
-
-    while n_decoded < max_new {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
-
-        if inner.model.is_eog_token(token) {
-            debug!(n_decoded, "stopped on EOG token");
-            break;
-        }
-
-        // `lstrip = None` matches the upstream `simple` example —
-        // llama.cpp will only insert leading whitespace when the
-        // tokenizer originally produced it, which is the right
-        // default for free-form generation.
-        let piece = inner
-            .model
-            .token_to_piece(token, &mut decoder, true, None)
-            .map_err(|e| DomainError::LlmFailed(format!("detokenize: {e}")))?;
-        output.push_str(&piece);
-        n_decoded += 1;
-
-        if let Some(stop) = options
-            .stop
+impl PieceSink for CollectSink {
+    fn on_piece(&mut self, piece: &str) -> Flow {
+        self.output.push_str(piece);
+        let hit = self
+            .stops
             .iter()
-            .find(|s| !s.is_empty() && output.contains(s.as_str()))
-        {
-            // Trim everything from the stop sequence onwards. We
-            // already consumed the tokens that produced it, but the
-            // contract is "stop sequence is NOT included in the
-            // output" — see GenerateOptions::stop.
-            if let Some(idx) = output.find(stop.as_str()) {
-                output.truncate(idx);
+            .find(|s| !s.is_empty() && self.output.contains(s.as_str()))
+            .and_then(|stop| self.output.find(stop.as_str()));
+        match hit {
+            Some(idx) => {
+                // Contract: the stop sequence is NOT part of the output
+                // (see `GenerateOptions::stop`).
+                self.output.truncate(idx);
+                Flow::Stop
             }
-            debug!(n_decoded, %stop, "stopped on stop sequence");
-            break;
+            None => Flow::Continue,
         }
-
-        batch.clear();
-        batch
-            .add(token, n_cur, &[0], true)
-            .map_err(|e| DomainError::LlmFailed(format!("batch.add gen: {e}")))?;
-        n_cur += 1;
-
-        ctx.decode(&mut batch)
-            .map_err(|e| DomainError::LlmFailed(format!("decode step: {e}")))?;
     }
 
-    if n_decoded == max_new {
-        warn!(max_new, "hit max_tokens without an EOG/stop token");
-    }
-
-    // Strip Qwen 3 <think>…</think> reasoning blocks — they are
-    // never useful to callers (summaries, chat one-shots, etc.).
-    let output = crate::shared::strip_think_blocks(&output);
-
-    Ok(output)
-}
-
-/// Streaming variant of [`generate_blocking`]. Sends each decoded
-/// piece over `tx`. The accumulated output (post think-block strip)
-/// is NOT sent as a final chunk — that's the caller's responsibility
-/// to aggregate. Stop-sequence handling trims the last piece before
-/// sending if the sequence appears mid-piece.
-fn generate_stream_blocking(
-    inner: &LoadedModel,
-    prompt: &str,
-    options: &GenerateOptions,
-    tx: &mpsc::Sender<Result<String, DomainError>>,
-) {
-    let result = generate_stream_inner(inner, prompt, options, tx);
-    if let Err(e) = result {
-        let _ = tx.blocking_send(Err(e));
+    fn is_closed(&self) -> bool {
+        self.done.is_closed()
     }
 }
 
-fn generate_stream_inner(
-    inner: &LoadedModel,
-    prompt: &str,
-    options: &GenerateOptions,
-    tx: &mpsc::Sender<Result<String, DomainError>>,
-) -> Result<(), DomainError> {
-    let n_ctx = NonZeroU32::new(inner.n_ctx)
-        .ok_or_else(|| DomainError::Invariant("n_ctx must be > 0".into()))?;
-
-    let mut ctx_params = LlamaContextParams::default()
-        .with_n_ctx(Some(n_ctx))
-        .with_n_batch(inner.n_ctx);
-    if let Some(threads) = inner.n_threads {
-        ctx_params = ctx_params.with_n_threads(threads);
-        ctx_params = ctx_params.with_n_threads_batch(threads);
+impl Sink for CollectSink {
+    fn finish(self: Box<Self>, result: Result<(), DomainError>) {
+        let Self { output, done, .. } = *self;
+        // Qwen 3 <think>…</think> blocks are never useful to callers
+        // (summaries, chat one-shots, etc.).
+        let _ = done.send(result.map(|()| crate::shared::strip_think_blocks(&output)));
     }
+}
 
-    let mut ctx = inner
-        .model
-        .new_context(inner.backend, ctx_params)
-        .map_err(|e| DomainError::LlmFailed(format!("create context: {e}")))?;
+/// [`Sink`] behind [`LlamaCppLlm::generate_stream`]: forwards each piece
+/// outside `<think>` blocks. The consumer aggregates the text; a stop
+/// sequence ends the stream without trimming the piece that completed it.
+/// A consumer that stops draining is cut off after a bounded stall (see
+/// [`Outlet`]).
+struct StreamSink {
+    output: String,
+    stops: Vec<String>,
+    in_think: bool,
+    out: Outlet<String>,
+}
 
-    let prompt_tokens = inner
-        .model
-        .str_to_token(prompt, AddBos::Never)
-        .map_err(|e| DomainError::LlmFailed(format!("tokenize prompt: {e}")))?;
-
-    let n_prompt = prompt_tokens.len() as i32;
-    let n_max_total = n_prompt.saturating_add(options.max_tokens.min(i32::MAX as u32) as i32);
-    if (n_max_total as u32) > inner.n_ctx {
-        return Err(DomainError::LlmFailed(format!(
-            "prompt ({} tok) + max_tokens ({}) exceeds context window ({})",
-            n_prompt, options.max_tokens, inner.n_ctx
-        )));
-    }
-
-    let batch_capacity = prompt_tokens.len().max(INITIAL_BATCH_TOKENS);
-    let mut batch = LlamaBatch::new(batch_capacity, 1);
-    let last_index = (prompt_tokens.len() as i32) - 1;
-    for (i, token) in (0_i32..).zip(prompt_tokens) {
-        let is_last = i == last_index;
-        batch
-            .add(token, i, &[0], is_last)
-            .map_err(|e| DomainError::LlmFailed(format!("batch.add prompt: {e}")))?;
-    }
-    ctx.decode(&mut batch)
-        .map_err(|e| DomainError::LlmFailed(format!("decode prompt: {e}")))?;
-
-    let seed = options.seed.map_or(1234, |s| s as u32);
-    let temp = options.temperature.clamp(0.0, 2.0);
-    let top_p = options.top_p.clamp(0.0, 1.0);
-    let mut sampler = if temp <= f32::EPSILON {
-        LlamaSampler::chain_simple([LlamaSampler::greedy()])
-    } else {
-        LlamaSampler::chain_simple([
-            LlamaSampler::top_p(top_p, 1),
-            LlamaSampler::temp(temp),
-            LlamaSampler::dist(seed),
-        ])
-    };
-
-    let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut output = String::new();
-    let mut n_cur = batch.n_tokens();
-    let mut n_decoded: u32 = 0;
-    let max_new = options.max_tokens;
-    // Track whether we're inside a <think> block so we skip sending those tokens.
-    let mut in_think_block = false;
-
-    while n_decoded < max_new {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
-
-        if inner.model.is_eog_token(token) {
-            break;
+impl StreamSink {
+    fn new(stops: Vec<String>, out: Outlet<String>) -> Self {
+        Self {
+            output: String::new(),
+            stops,
+            in_think: false,
+            out,
         }
+    }
+}
 
-        let piece = inner
-            .model
-            .token_to_piece(token, &mut decoder, true, None)
-            .map_err(|e| DomainError::LlmFailed(format!("detokenize: {e}")))?;
-        output.push_str(&piece);
-        n_decoded += 1;
+impl PieceSink for StreamSink {
+    fn on_piece(&mut self, piece: &str) -> Flow {
+        self.output.push_str(piece);
 
         // Detect <think> blocks and suppress them from streaming output.
-        if output.contains("<think>") && !output.contains("</think>") {
-            in_think_block = true;
+        if self.output.contains("<think>") && !self.output.contains("</think>") {
+            self.in_think = true;
         }
-        if in_think_block && output.contains("</think>") {
-            in_think_block = false;
-            // Don't send this piece — it's part of the think block ending.
-        } else if !in_think_block {
-            // Only send pieces that are outside think blocks.
-            if tx.blocking_send(Ok(piece)).is_err() {
-                // Consumer dropped — abort decoding.
-                return Ok(());
-            }
+        if self.in_think && self.output.contains("</think>") {
+            // The piece closing the block is part of it: not forwarded.
+            self.in_think = false;
+        } else if !self.in_think && self.out.push(piece.to_string()) == Flow::Stop {
+            return Flow::Stop;
         }
 
-        if let Some(stop) = options
-            .stop
+        let stopped = self
+            .stops
             .iter()
-            .find(|s| !s.is_empty() && output.contains(s.as_str()))
-        {
-            debug!(n_decoded, %stop, "stream stopped on stop sequence");
-            break;
+            .any(|s| !s.is_empty() && self.output.contains(s.as_str()));
+        if stopped {
+            debug!("stream stopped on stop sequence");
+            Flow::Stop
+        } else {
+            Flow::Continue
         }
-
-        batch.clear();
-        batch
-            .add(token, n_cur, &[0], true)
-            .map_err(|e| DomainError::LlmFailed(format!("batch.add gen: {e}")))?;
-        n_cur += 1;
-
-        ctx.decode(&mut batch)
-            .map_err(|e| DomainError::LlmFailed(format!("decode step: {e}")))?;
     }
 
-    Ok(())
+    fn is_closed(&self) -> bool {
+        self.out.is_closed()
+    }
+}
+
+impl Sink for StreamSink {
+    fn bind_cancel(&mut self, cancel: Cancel) {
+        self.out.bind_cancel(cancel);
+    }
+
+    fn finish(mut self: Box<Self>, result: Result<(), DomainError>) {
+        if let Err(e) = result {
+            self.out.fail(e);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -600,5 +444,157 @@ mod tests {
         let err =
             LlamaCppLlm::load("/nonexistent/path/to/model.gguf").expect_err("expected load error");
         assert!(matches!(err, DomainError::ModelNotLoaded(_)), "got {err:?}");
+    }
+
+    // ---- production sinks (characterisation: they pass on first run) ----
+
+    use std::time::{Duration, Instant};
+
+    fn collect_sink(
+        stops: &[&str],
+    ) -> (CollectSink, oneshot::Receiver<Result<String, DomainError>>) {
+        let (done, rx) = oneshot::channel();
+        let sink = CollectSink {
+            output: String::new(),
+            stops: stops.iter().map(|s| (*s).to_string()).collect(),
+            done,
+        };
+        (sink, rx)
+    }
+
+    fn stream_sink(
+        stops: &[&str],
+        capacity: usize,
+        stall: Duration,
+    ) -> (StreamSink, mpsc::Receiver<Result<String, DomainError>>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let sink = StreamSink::new(
+            stops.iter().map(|s| (*s).to_string()).collect(),
+            Outlet::new(tx).with_stall(stall),
+        );
+        (sink, rx)
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<Result<String, DomainError>>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            out.push(item.expect("piece"));
+        }
+        out
+    }
+
+    #[test]
+    fn collect_sink_truncates_at_the_stop_sequence_and_stops() {
+        let (mut sink, mut rx) = collect_sink(&["###"]);
+        assert_eq!(sink.on_piece("hello "), Flow::Continue);
+        assert_eq!(sink.on_piece("wor#"), Flow::Continue);
+        assert_eq!(sink.on_piece("## tail"), Flow::Stop);
+        Box::new(sink).finish(Ok(()));
+        assert_eq!(rx.try_recv().unwrap().unwrap(), "hello wor");
+    }
+
+    #[test]
+    fn collect_sink_ignores_empty_stop_sequences() {
+        let (mut sink, mut rx) = collect_sink(&[""]);
+        assert_eq!(sink.on_piece("abc"), Flow::Continue);
+        Box::new(sink).finish(Ok(()));
+        assert_eq!(rx.try_recv().unwrap().unwrap(), "abc");
+    }
+
+    #[test]
+    fn collect_sink_strips_think_blocks_on_finish() {
+        let (mut sink, mut rx) = collect_sink(&[]);
+        sink.on_piece("<think>plan</think>");
+        sink.on_piece("answer");
+        Box::new(sink).finish(Ok(()));
+        assert_eq!(rx.try_recv().unwrap().unwrap(), "answer");
+    }
+
+    #[test]
+    fn collect_sink_reports_closed_when_the_future_is_dropped() {
+        let (sink, rx) = collect_sink(&[]);
+        assert!(!sink.is_closed());
+        drop(rx);
+        assert!(sink.is_closed());
+    }
+
+    #[test]
+    fn collect_sink_forwards_an_error_instead_of_the_text() {
+        let (mut sink, mut rx) = collect_sink(&[]);
+        sink.on_piece("partial");
+        Box::new(sink).finish(Err(DomainError::LlmFailed("decode failed".into())));
+        let err = rx.try_recv().unwrap().unwrap_err();
+        assert!(err.to_string().contains("decode failed"), "{err}");
+    }
+
+    #[test]
+    fn stream_sink_suppresses_think_blocks_and_forwards_the_rest() {
+        let (mut sink, mut rx) = stream_sink(&[], 16, Duration::from_secs(1));
+        for piece in ["<think>", "hidden", "</think>", "Hola", " mundo"] {
+            assert_eq!(sink.on_piece(piece), Flow::Continue);
+        }
+        assert_eq!(drain(&mut rx), ["Hola", " mundo"]);
+    }
+
+    #[test]
+    fn stream_sink_stops_after_the_piece_completing_a_stop_sequence() {
+        let (mut sink, mut rx) = stream_sink(&["END"], 16, Duration::from_secs(1));
+        assert_eq!(sink.on_piece("a"), Flow::Continue);
+        // Documented contract: the completing piece is still forwarded.
+        assert_eq!(sink.on_piece("END"), Flow::Stop);
+        assert_eq!(drain(&mut rx), ["a", "END"]);
+    }
+
+    #[test]
+    fn stream_sink_cancels_when_the_receiver_is_dropped() {
+        let (mut sink, rx) = stream_sink(&[], 16, Duration::from_secs(1));
+        assert!(!sink.is_closed());
+        drop(rx);
+        assert!(sink.is_closed());
+        assert_eq!(sink.on_piece("x"), Flow::Stop);
+    }
+
+    #[test]
+    fn stream_sink_forwards_the_error_as_the_final_item() {
+        let (mut sink, mut rx) = stream_sink(&[], 16, Duration::from_secs(1));
+        sink.on_piece("a");
+        Box::new(sink).finish(Err(DomainError::LlmFailed("decode failed".into())));
+        assert_eq!(rx.try_recv().unwrap().unwrap(), "a");
+        let err = rx.try_recv().unwrap().unwrap_err();
+        assert!(err.to_string().contains("decode failed"), "{err}");
+    }
+
+    #[test]
+    fn stream_sink_gives_up_on_a_consumer_that_stalls() {
+        let (mut sink, mut rx) = stream_sink(&[], 1, Duration::from_millis(40));
+        assert_eq!(sink.on_piece("a"), Flow::Continue);
+        let started = Instant::now();
+        // Buffer full and nobody draining: bounded wait, then cancel.
+        assert_eq!(sink.on_piece("b"), Flow::Stop);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The final error is dropped rather than waiting a second time.
+        let started = Instant::now();
+        Box::new(sink).finish(Err(DomainError::LlmFailed("late".into())));
+        assert!(started.elapsed() < Duration::from_millis(30));
+        assert_eq!(drain(&mut rx), ["a"]);
+    }
+
+    #[test]
+    fn stream_sink_stops_waiting_when_the_worker_cancels() {
+        let (mut sink, _rx) = stream_sink(&[], 1, Duration::from_secs(60));
+        let cancel = Cancel::default();
+        sink.bind_cancel(cancel.clone());
+        assert_eq!(sink.on_piece("a"), Flow::Continue);
+        let canceller = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                cancel.set();
+            })
+        };
+        let started = Instant::now();
+        assert_eq!(sink.on_piece("b"), Flow::Stop);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        canceller.join().unwrap();
     }
 }
