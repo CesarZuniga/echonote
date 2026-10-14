@@ -594,7 +594,7 @@ fn build_and_play_stream(
         move |err: cpal::StreamError| match classify(&err) {
             Severity::Transient => {
                 let seen = transient_seen.fetch_add(1, Ordering::Relaxed);
-                if seen % TRANSIENT_LOG_EVERY == 0 {
+                if seen.is_multiple_of(TRANSIENT_LOG_EVERY) {
                     debug!(
                         error = %err,
                         occurrences = seen + 1,
