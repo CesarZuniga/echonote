@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use echo_app::SummarizeMeeting;
-use echo_domain::{DomainError, GenerateOptions, LlmModel, SummaryContent};
+use echo_domain::{ChatMessage, DomainError, GenerateOptions, LlmModel, SummaryContent};
 use echo_llm::LlamaCppLlm;
 
 mod common;
@@ -54,14 +54,27 @@ impl LlmModel for CountingLlm {
     fn count_tokens(&self, text: &str) -> usize {
         self.inner.count_tokens(text)
     }
+    fn count_chat_tokens(&self, messages: &[ChatMessage]) -> usize {
+        self.inner.count_chat_tokens(messages)
+    }
     async fn generate(
         &self,
         prompt: &str,
         options: &GenerateOptions,
     ) -> Result<String, DomainError> {
+        self.inner.generate(prompt, options).await
+    }
+    async fn generate_chat(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerateOptions,
+    ) -> Result<String, DomainError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        let response = self.inner.generate(prompt, options).await?;
-        if prompt.contains("meticulous meeting note-taker") {
+        let response = self.inner.generate_chat(messages, options).await?;
+        if messages
+            .iter()
+            .any(|m| m.content.contains("meticulous meeting note-taker"))
+        {
             self.map_notes.lock().unwrap().push(response.clone());
         }
         // Diagnostics only: shows whether a note reached its output cap.
@@ -72,13 +85,13 @@ impl LlmModel for CountingLlm {
         );
         Ok(response)
     }
-    async fn generate_stream(
+    async fn generate_chat_stream(
         &self,
-        prompt: &str,
+        messages: &[ChatMessage],
         options: &GenerateOptions,
     ) -> Result<BoxStream<'static, Result<String, DomainError>>, DomainError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.generate_stream(prompt, options).await
+        self.inner.generate_chat_stream(messages, options).await
     }
 }
 
@@ -110,6 +123,27 @@ async fn run_summary(utterances: &[String]) -> (String, usize, Vec<String>) {
 
     let json = serde_json::to_string_pretty(&summary.content).unwrap();
     eprintln!("elapsed: {elapsed:.1}s, LLM calls: {calls}\n{json}");
+
+    // Evidence first: where the planted fact ended up, even when the final
+    // output then fails the structure check below.
+    {
+        let notes = llm.map_notes.lock().unwrap();
+        let holders: Vec<usize> = notes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.contains(PLANTED_NUMBER))
+            .map(|(i, _)| i + 1)
+            .collect();
+        eprintln!(
+            "map notes: {}; planted fact in map note(s) {holders:?}; in final output: {}",
+            notes.len(),
+            json.contains(PLANTED_NUMBER)
+        );
+        for (i, note) in notes.iter().enumerate() {
+            let head: String = note.chars().take(500).collect();
+            eprintln!("map note {} ({} chars): {head:?}", i + 1, note.len());
+        }
+    }
 
     match &summary.content {
         SummaryContent::FreeText { text } => {
