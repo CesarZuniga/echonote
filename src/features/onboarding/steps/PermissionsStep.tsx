@@ -3,20 +3,13 @@ import { useTranslation } from "react-i18next";
 import { Mic, Check } from "lucide-react";
 
 import { startStreaming, stopStreaming, getMeetingId, deleteMeeting } from "../../../ipc/client";
+import { isIpcError } from "../../../types/ipc-error";
 
 type Status = "idle" | "checking" | "granted" | "denied" | "deferred";
 
-/** Backend errors arrive as a serialized `IpcError`; anything else is opaque. */
-function ipcErrorCode(err: unknown): string | null {
-  return typeof err === "object" && err !== null && "code" in err
-    ? String((err as { code: unknown }).code)
-    : null;
-}
-
-function ipcErrorMessage(err: unknown): string | null {
-  if (typeof err === "object" && err !== null && "message" in err) {
-    return String((err as { message: unknown }).message);
-  }
+/** Human-readable detail for a failed probe; plain strings pass through. */
+function errorDetail(err: unknown): string | null {
+  if (isIpcError(err)) return err.message;
   return typeof err === "string" ? err : null;
 }
 
@@ -54,11 +47,11 @@ export function PermissionsStep({ onNext }: Readonly<{ onNext: () => void }>) {
       if (meetingId) await deleteMeeting(meetingId).catch(() => {});
       setStatus("granted");
     } catch (err) {
-      const code = ipcErrorCode(err);
       // The probe runs a full streaming session, so it can fail for
       // reasons that have nothing to do with audio access.
-      setStatus(code === "modelNotReady" ? "deferred" : "denied");
-      setDetail(ipcErrorMessage(err));
+      const modelMissing = isIpcError(err) && err.code === "modelNotReady";
+      setStatus(modelMissing ? "deferred" : "denied");
+      setDetail(errorDetail(err));
     }
   }, []);
 
