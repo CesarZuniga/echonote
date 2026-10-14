@@ -31,8 +31,8 @@ the channel listed in that document.
 - **macOS 13+** (primary dev target) or **Linux** (Ubuntu 22.04+ tested).
   Windows is supported via WSL2 only.
 - **Xcode Command Line Tools** on macOS (`xcode-select --install`).
-- **Rust 1.88.0+** (pinned via `rust-toolchain.toml`).
-- **Node.js 20 LTS** and **pnpm 9** (needed from Sprint 0 day 4 onwards).
+- **Rust 1.99.0+** (pinned via `rust-toolchain.toml`).
+- **Node.js 20 LTS** and **pnpm 10** (pinned via `packageManager`; build-script allowlist lives in `pnpm-workspace.yaml`).
 
 ### First run
 
